@@ -1,0 +1,18 @@
+[package]
+name = "graymul-py"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Python bindings for GrayMUL"
+
+[lib]
+name = "_graymul"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+graymul-core = { path = "../graymul-core" }
+num-bigint.workspace = true
+pyo3.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "graymul-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Cross-validation benchmark for GrayMUL"
+
+[[bin]]
+name = "graymul-bench"
+path = "src/main.rs"
+
+[dependencies]
+graymul-core = { path = "../graymul-core" }
+num-bigint.workspace = true
+num-traits.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true

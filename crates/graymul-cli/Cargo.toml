@@ -1,0 +1,24 @@
+[package]
+name = "graymul-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Command line interface for GrayMUL"
+
+[[bin]]
+name = "graymul"
+path = "src/main.rs"
+
+[dependencies]
+graymul-core = { path = "../graymul-core" }
+num-bigint.workspace = true
+clap.workspace = true
+ctrlc.workspace = true
+serde_json.workspace = true
+mimalloc = { workspace = true, optional = true }
+
+[features]
+default = ["mimalloc"]
+mimalloc = ["dep:mimalloc"]

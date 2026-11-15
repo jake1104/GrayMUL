@@ -1,0 +1,99 @@
+{
+  "version": "0.1.0",
+  "bands": [
+    {
+      "min_limbs": 1,
+      "max_limbs": 64,
+      "engine": "schoolbook",
+      "verdict": "conservative",
+      "reason": "no certified holder in-band; nearest miss schoolbook-vs-karatsuba@16 ratio 0.00 of band; simplest in-band engine per rule | rows: ",
+      "cites": [
+        "logs/0.0.0.18.1/A-sb-kara-small.json"
+      ]
+    },
+    {
+      "min_limbs": 64,
+      "max_limbs": 256,
+      "engine": "schoolbook",
+      "verdict": "conservative",
+      "reason": "no certified holder in-band; nearest miss karatsuba-vs-toom3@128 ratio 0.05 of band; simplest in-band engine per rule | rows: karatsuba@128 toom3 margin=2150.0 band=46149.6 no",
+      "cites": [
+        "logs/0.0.0.18.1/A-sb-kara-small.json",
+        "logs/0.0.0.18.1/C-kara-toom3.json"
+      ]
+    },
+    {
+      "min_limbs": 256,
+      "max_limbs": 1024,
+      "engine": "schoolbook",
+      "verdict": "conservative",
+      "reason": "no certified holder in-band; nearest miss karatsuba-vs-toom3@768 ratio 0.99 of band; simplest in-band engine per rule | rows: schoolbook@512 karatsuba margin=2900.0 band=240755.9 no; karatsuba@256 toom3 margin=18700.0 band=53991.0 no; karatsuba@512 toom3 margin=72650.0 band=198945.2 no; toom3@256 toom4 margin=20750.0 band=50418.0 no; toom3@512 toom4 margin=13850.0 band=208044.5 no; schoolbook@512 karatsuba margin=400.0 band=364101.4 no; schoolbook@768 karatsuba margin=300.0 band=758388.7 no; karatsuba@512 toom3 margin=167300.0 band=170745.3 no; karatsuba@768 toom3 margin=635500.0 band=644979.1 no; toom3@512 toom4 margin=8200.0 band=248646.8 no; toom3@768 toom4 margin=10300.0 band=283080.4 no",
+      "cites": [
+        "logs/0.0.0.18.1/A-sb-kara-small.json",
+        "logs/0.0.0.18.1/B1-sb-kara-512.json",
+        "logs/0.0.0.18.1/C-kara-toom3.json",
+        "logs/0.0.0.18.1/D1-toom3-toom4-small.json",
+        "logs/0.0.0.18.3/fix-r1-A-sb-kara.json",
+        "logs/0.0.0.18.3/fix-r1-B-kara-toom3.json",
+        "logs/0.0.0.18.3/fix-r1-C-toom3-toom4.json"
+      ]
+    },
+    {
+      "min_limbs": 1024,
+      "max_limbs": 2048,
+      "engine": "toom3",
+      "verdict": "certified",
+      "reason": "certified in-band wins: toom3@1024; toom3@1536 | rows: schoolbook@1024 karatsuba margin=4900.0 band=451441.9 no; toom3@1024 toom4 margin=24500.0 band=1288692.4 no; toom4@1024 ssa margin=3048700.0 band=3383728.8 no; ssa@1024 furer margin=13200.0 band=1768913.1 no; furer@1024 hvh margin=6900.0 band=4100293.8 no; schoolbook@1024 karatsuba margin=2500.0 band=219625.8 no; schoolbook@1536 karatsuba margin=720300.0 band=390824.0 CLEAR; karatsuba@1024 toom3 margin=795000.0 band=248429.8 CLEAR; karatsuba@1536 toom3 margin=1219400.0 band=560161.7 CLEAR; toom3@1024 toom4 margin=9100.0 band=117170.1 no; toom3@1536 toom4 margin=52500.0 band=632713.8 no",
+      "cites": [
+        "logs/0.0.0.18.1/B2-sb-kara-big.json",
+        "logs/0.0.0.18.1/D2-toom3-toom4-big.json",
+        "logs/0.0.0.18.1/E-toom4-ssa.json",
+        "logs/0.0.0.18.1/F-ssa-furer.json",
+        "logs/0.0.0.18.1/G-furer-hvh.json",
+        "logs/0.0.0.18.3/fix-r1-A-sb-kara.json",
+        "logs/0.0.0.18.3/fix-r1-B-kara-toom3.json",
+        "logs/0.0.0.18.3/fix-r1-C-toom3-toom4.json"
+      ]
+    },
+    {
+      "min_limbs": 2048,
+      "max_limbs": 8192,
+      "engine": "toom4",
+      "verdict": "certified",
+      "reason": "certified in-band wins: toom4@2048 | rows: schoolbook@2048 karatsuba margin=1594650.0 band=2759104.5 no; toom3@2048 toom4 margin=8300.0 band=3448290.5 no; toom4@2048 ssa margin=4995050.0 band=2040187.0 CLEAR; toom4@4096 ssa margin=8709750.0 band=10100071.4 no; ssa@4096 furer margin=667850.0 band=8511708.7 no; furer@4096 hvh margin=120550.0 band=12336640.4 no; schoolbook@2048 karatsuba margin=1524050.0 band=4951629.9 no; karatsuba@2048 toom3 margin=2372600.0 band=2030567.1 CLEAR; toom3@2048 toom4 margin=1600.0 band=493286.4 no",
+      "cites": [
+        "logs/0.0.0.18.1/B2-sb-kara-big.json",
+        "logs/0.0.0.18.1/D2-toom3-toom4-big.json",
+        "logs/0.0.0.18.1/E-toom4-ssa.json",
+        "logs/0.0.0.18.1/F-ssa-furer.json",
+        "logs/0.0.0.18.1/G-furer-hvh.json",
+        "logs/0.0.0.18.3/fix-r1-A-sb-kara.json",
+        "logs/0.0.0.18.3/fix-r1-B-kara-toom3.json",
+        "logs/0.0.0.18.3/fix-r1-C-toom3-toom4.json"
+      ]
+    },
+    {
+      "min_limbs": 8192,
+      "max_limbs": 16384,
+      "engine": "toom4",
+      "verdict": "conservative",
+      "reason": "no certified holder in-band; nearest miss toom4-vs-ssa@8192 ratio 0.37 of band; simplest in-band engine per rule | rows: toom4@8192 ssa margin=12578850.0 band=33580320.8 no",
+      "cites": [
+        "logs/0.0.0.18.1/E-toom4-ssa.json"
+      ]
+    },
+    {
+      "min_limbs": 16384,
+      "max_limbs": null,
+      "engine": "toom4",
+      "verdict": "conservative",
+      "reason": "no certified holder in-band; nearest miss toom4-vs-ssa@16384 ratio 0.17 of band; simplest in-band engine per rule | rows: toom4@16384 ssa margin=8332850.0 band=49838252.0 no",
+      "cites": [
+        "logs/0.0.0.18.1/E-toom4-ssa.json"
+      ]
+    }
+  ],
+  "generated_by": "probe/0.0.0.18.1-gen.py",
+  "generated_at": "2026-11-10T09:30:43+00:00",
+  "seed": 11400714819323198485
+}

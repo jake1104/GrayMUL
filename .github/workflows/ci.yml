@@ -1,0 +1,51 @@
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  gates:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        run: cargo test --workspace
+      - name: release-build
+        run: cargo build -p graymul-cli --release
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: wheel-pytest-gate
+        run: |
+          pip install maturin pytest
+          maturin build --release --out wheels-ci
+          $wheel = (Get-ChildItem wheels-ci/graymul-*.whl | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
+          pip install --force-reinstall --no-deps $wheel
+          python -m pytest -q python/tests
+      - name: version-drift-guard
+        run: python scripts/check_version.py
+      - name: api-surface-guard
+        run: python scripts/check_api_surface.py
+      - name: invariants-guard
+        run: python scripts/check_invariants.py
+  release-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: release-build
+        run: cargo build -p graymul-cli -p graymul-bench --release
+      - name: perf-smoke
+        run: python scripts/perf_smoke.py
