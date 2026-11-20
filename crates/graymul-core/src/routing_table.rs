@@ -1,6 +1,6 @@
 use crate::dispatch::Engine;
 
-pub const ROUTING_TABLE_VERSION: &str = "0.1.0";
+pub const ROUTING_TABLE_VERSION: &str = "0.1.1";
 
 pub const ROUTING_TABLE: [(u64, u64, &str); 7] = [
     (1, 64, "schoolbook"),

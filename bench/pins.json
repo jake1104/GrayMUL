@@ -1,5 +1,5 @@
 {
-  "version": "0.1.0",
+  "version": "0.1.1",
   "band_policy": {
     "note": "Time is managed as bands only, never as pins. This file carries no ref_ms and no elapsed_ms pins. Band upper bounds live in each cell band_ms; scripts/perf_smoke.py enforces membership only.",
     "source": "scripts/perf_smoke.py"

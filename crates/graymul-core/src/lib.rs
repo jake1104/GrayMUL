@@ -1,6 +1,7 @@
 pub mod cascade;
 pub mod dispatch;
 pub mod error;
+pub mod explain;
 pub mod furer;
 pub mod hvh;
 pub mod hvh_full;
@@ -9,6 +10,7 @@ pub mod limb;
 pub mod multiply;
 pub mod ntt;
 pub mod options;
+pub mod par;
 pub mod rate_cache;
 pub mod report;
 pub mod routing_table;
@@ -17,6 +19,7 @@ pub mod schoolbook;
 pub mod scratch;
 pub mod small_ntt;
 pub mod split;
+pub mod time;
 pub mod toom;
 pub mod verify;
 

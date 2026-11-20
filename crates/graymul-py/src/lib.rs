@@ -41,12 +41,39 @@ fn stage_timing_to_py(py: Python<'_>, entry: StageTiming) -> PyResult<Py<PyDict>
     Ok(dict.unbind())
 }
 
-fn parse_operand(text: &str) -> Result<BigUint, MultiplyError> {
+fn split_sign(text: &str) -> (bool, &str) {
+    if let Some(rest) = text.strip_prefix('-') {
+        (true, rest)
+    } else if let Some(rest) = text.strip_prefix('+') {
+        (false, rest)
+    } else {
+        (false, text)
+    }
+}
+
+fn parse_operand(text: &str) -> Result<(bool, BigUint), MultiplyError> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return Err(MultiplyError::Input("empty integer".to_string()));
     }
-    BigUint::from_str(trimmed).map_err(|_| MultiplyError::Input(invalid_integer_message(trimmed)))
+    let (negative, digits) = split_sign(trimmed);
+    if digits.is_empty() {
+        return Err(MultiplyError::Input(invalid_integer_message(trimmed)));
+    }
+    BigUint::from_str(digits)
+        .map(|value| (negative, value))
+        .map_err(|_| MultiplyError::Input(invalid_integer_message(trimmed)))
+}
+
+fn apply_sign(product: String, negative: bool) -> String {
+    if negative && product != "0" {
+        let mut signed = String::with_capacity(product.len() + 1);
+        signed.push('-');
+        signed.push_str(&product);
+        signed
+    } else {
+        product
+    }
 }
 
 fn invalid_integer_message(text: &str) -> String {
@@ -107,12 +134,18 @@ fn multiply_decimal(
         max_cpu_seconds,
         perf_mode,
     );
-    let a_value = parse_operand(a).map_err(to_py_error)?;
-    let b_value = parse_operand(b).map_err(to_py_error)?;
+    let (neg_a, a_value) = match parse_operand(a) {
+        Ok(pair) => pair,
+        Err(error) => return Err(to_py_error(error)),
+    };
+    let (neg_b, b_value) = match parse_operand(b) {
+        Ok(pair) => pair,
+        Err(error) => return Err(to_py_error(error)),
+    };
     let report = py
         .detach(|| graymul_core::multiply(&a_value, &b_value, &options))
         .map_err(to_py_error)?;
-    Ok(report.product)
+    Ok(apply_sign(report.product, neg_a != neg_b))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -142,8 +175,9 @@ fn multiply_with_progress_decimal(
     );
     if let Some(callback) = callback {
         py.detach(|| {
-            let a_value = parse_operand(a).map_err(to_py_error)?;
-            let b_value = parse_operand(b).map_err(to_py_error)?;
+            let (neg_a, a_value) = parse_operand(a).map_err(to_py_error)?;
+            let (neg_b, b_value) = parse_operand(b).map_err(to_py_error)?;
+            let negative = neg_a != neg_b;
             let flag = AtomicBool::new(false);
             Python::attach(|py| {
                 let mut bridge = |event: &ProgressEvent| -> Result<(), MultiplyError> {
@@ -183,7 +217,7 @@ fn multiply_with_progress_decimal(
                     &mut bridge,
                     None,
                 )
-                .map(|report| report.product)
+                .map(|report| apply_sign(report.product, negative))
                 .map_err(to_py_error)
             })
         })
@@ -227,8 +261,8 @@ fn stage_timings_decimal(
         max_cpu_seconds,
         perf_mode,
     );
-    let a_value = parse_operand(a).map_err(to_py_error)?;
-    let b_value = parse_operand(b).map_err(to_py_error)?;
+    let (_, a_value) = parse_operand(a).map_err(to_py_error)?;
+    let (_, b_value) = parse_operand(b).map_err(to_py_error)?;
     let collector = TimingCollector::new();
     let flag = AtomicBool::new(false);
     let mut sink = |_: &ProgressEvent| Ok(());
@@ -274,8 +308,9 @@ fn multiply_report_decimal(
         max_cpu_seconds,
         perf_mode,
     );
-    let a_value = parse_operand(a).map_err(to_py_error)?;
-    let b_value = parse_operand(b).map_err(to_py_error)?;
+    let (neg_a, a_value) = parse_operand(a).map_err(to_py_error)?;
+    let (neg_b, b_value) = parse_operand(b).map_err(to_py_error)?;
+    let negative = neg_a != neg_b;
     let collector = TimingCollector::new();
     let flag = AtomicBool::new(false);
     let mut sink = |_: &ProgressEvent| Ok(());
@@ -292,7 +327,7 @@ fn multiply_report_decimal(
         })
         .map_err(to_py_error)?;
     let dict = PyDict::new(py);
-    dict.set_item("product", report.product)?;
+    dict.set_item("product", apply_sign(report.product, negative))?;
     dict.set_item("method", report.method)?;
     dict.set_item("limbs", report.limbs)?;
     dict.set_item("elapsed_ms", report.elapsed_ms)?;
@@ -310,12 +345,95 @@ fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+#[pyo3(signature = (a, b, threads=None, timeout_seconds=None, max_memory_mb=None, max_cpu_seconds=None))]
+fn explain_decimal(
+    py: Python<'_>,
+    a: &str,
+    b: &str,
+    threads: Option<usize>,
+    timeout_seconds: Option<u64>,
+    max_memory_mb: Option<usize>,
+    max_cpu_seconds: Option<u64>,
+) -> PyResult<Py<PyDict>> {
+    let options = MultiplyOptions {
+        algorithm: None,
+        threads,
+        max_duration: timeout_seconds.map(std::time::Duration::from_secs),
+        max_memory_mb,
+        max_cpu_seconds,
+        seed: MultiplyOptions::default().seed,
+        perf_mode: false,
+    };
+    let (neg_a, a_value) = parse_operand(a).map_err(to_py_error)?;
+    let (neg_b, b_value) = parse_operand(b).map_err(to_py_error)?;
+    let plan = py.detach(|| {
+        graymul_core::explain::explain_bigints(&a_value, &b_value, neg_a, neg_b, &options)
+    });
+    let dict = PyDict::new(py);
+    let operands = PyDict::new(py);
+    operands.set_item("limbs_a", plan.operands.limbs_a)?;
+    operands.set_item("limbs_b", plan.operands.limbs_b)?;
+    operands.set_item("limbs_max", plan.operands.limbs_max)?;
+    operands.set_item("ratio", plan.operands.ratio)?;
+    operands.set_item("negative_a", plan.operands.negative_a)?;
+    operands.set_item("negative_b", plan.operands.negative_b)?;
+    operands.set_item("negative", plan.operands.negative)?;
+    let dispatch = PyDict::new(py);
+    dispatch.set_item("static_route", plan.dispatch.static_route)?;
+    dispatch.set_item("selected", plan.dispatch.selected)?;
+    dispatch.set_item("reason", plan.dispatch.reason)?;
+    dispatch.set_item("warmed_override", plan.dispatch.warmed_override)?;
+    let resources = PyDict::new(py);
+    resources.set_item("workers", plan.resources.workers)?;
+    resources.set_item("est_memory_bytes", plan.resources.est_memory_bytes)?;
+    resources.set_item("timeout_ms", plan.resources.timeout_ms)?;
+    let verification = PyDict::new(py);
+    verification.set_item("methods", plan.verification.methods)?;
+    dict.set_item("operands", operands)?;
+    dict.set_item("dispatch", dispatch)?;
+    dict.set_item("resources", resources)?;
+    dict.set_item("verification", verification)?;
+    Ok(dict.unbind())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn base_options() -> MultiplyOptions {
         build_options(None, None, None, None, None, None, false)
+    }
+
+    #[test]
+    fn parse_operand_accepts_sign_prefix() {
+        assert_eq!(
+            parse_operand("-5").expect("minus"),
+            (true, BigUint::from(5u32))
+        );
+        assert_eq!(
+            parse_operand("+5").expect("plus"),
+            (false, BigUint::from(5u32))
+        );
+        assert_eq!(
+            parse_operand("  -007  ").expect("padded"),
+            (true, BigUint::from(7u32))
+        );
+        assert_eq!(
+            parse_operand("42").expect("plain"),
+            (false, BigUint::from(42u32))
+        );
+        for text in ["", "   ", "-", "+", "--5", "- 5", "12x34"] {
+            assert!(parse_operand(text).is_err(), "text {text} should fail");
+        }
+    }
+
+    #[test]
+    fn apply_sign_prefixes_nonzero_negative_product() {
+        assert_eq!(apply_sign("408".to_string(), true), "-408");
+        assert_eq!(apply_sign("408".to_string(), false), "408");
+        assert_eq!(apply_sign("0".to_string(), true), "0");
     }
 
     #[test]
@@ -466,6 +584,7 @@ fn _graymul(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(multiply_with_progress_decimal, module)?)?;
     module.add_function(wrap_pyfunction!(stage_timings_decimal, module)?)?;
     module.add_function(wrap_pyfunction!(multiply_report_decimal, module)?)?;
+    module.add_function(wrap_pyfunction!(explain_decimal, module)?)?;
     module.add_function(wrap_pyfunction!(version, module)?)?;
     Ok(())
 }

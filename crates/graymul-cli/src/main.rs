@@ -77,6 +77,20 @@ enum Commands {
         )]
         continue_on_error: bool,
     },
+    Explain {
+        #[arg(
+            allow_hyphen_values = true,
+            help = "First decimal integer (an optional sign prefix is allowed)"
+        )]
+        a: String,
+        #[arg(
+            allow_hyphen_values = true,
+            help = "Second decimal integer (an optional sign prefix is allowed)"
+        )]
+        b: String,
+        #[arg(long, help = "Emit the plan as a single JSON object on stdout")]
+        json: bool,
+    },
 }
 
 fn options_from_cli(cli: &Cli) -> MultiplyOptions {
@@ -95,12 +109,28 @@ fn options_from_cli(cli: &Cli) -> MultiplyOptions {
     }
 }
 
-fn parse_decimal(text: &str) -> Result<BigUint, MultiplyError> {
+fn split_sign(text: &str) -> (bool, &str) {
+    if let Some(rest) = text.strip_prefix('-') {
+        (true, rest)
+    } else if let Some(rest) = text.strip_prefix('+') {
+        (false, rest)
+    } else {
+        (false, text)
+    }
+}
+
+fn parse_decimal(text: &str) -> Result<(bool, BigUint), MultiplyError> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return Err(MultiplyError::Input("empty integer".to_string()));
     }
-    BigUint::from_str(trimmed).map_err(|_| MultiplyError::Input(invalid_integer_message(trimmed)))
+    let (negative, digits) = split_sign(trimmed);
+    if digits.is_empty() {
+        return Err(MultiplyError::Input(invalid_integer_message(trimmed)));
+    }
+    BigUint::from_str(digits)
+        .map(|value| (negative, value))
+        .map_err(|_| MultiplyError::Input(invalid_integer_message(trimmed)))
 }
 
 fn invalid_integer_message(text: &str) -> String {
@@ -142,7 +172,7 @@ fn multiply_pair(
         Ok(pair) => pair,
         Err(error) => return (Err(error), Vec::new()),
     };
-    let (a, b) = parsed;
+    let ((neg_a, a), (neg_b, b)) = parsed;
     let collector = TimingCollector::new();
     let mut on_event = |event: &ProgressEvent| {
         if show_progress {
@@ -157,7 +187,13 @@ fn multiply_pair(
         token.as_atomic(),
         &mut on_event,
         Some(&collector),
-    );
+    )
+    .map(|mut report| {
+        if neg_a != neg_b && report.product != "0" {
+            report.product.insert(0, '-');
+        }
+        report
+    });
     (result, collector.snapshot())
 }
 
@@ -169,6 +205,7 @@ fn main() -> ExitCode {
             continue_on_error,
             ..
         }) => run_batch(&cli, input, *continue_on_error),
+        Some(Commands::Explain { a, b, json }) => run_explain(&cli, a, b, *json),
         None => run_single(&cli),
     }
 }
@@ -330,6 +367,39 @@ fn run_batch(cli: &Cli, input: &PathBuf, continue_on_error: bool) -> ExitCode {
         &mut emit,
     );
     batch_exit_code(failed, token.is_cancelled())
+}
+
+fn run_explain(cli: &Cli, a_text: &str, b_text: &str, as_json: bool) -> ExitCode {
+    let options = options_from_cli(cli);
+    if let Err(error) = options.validate() {
+        if as_json {
+            print_json(&json_error_value(&error, None));
+        } else {
+            report_error(&error);
+        }
+        return ExitCode::FAILURE;
+    }
+    let parsed = match parse_decimal(a_text).and_then(|a| parse_decimal(b_text).map(|b| (a, b))) {
+        Ok(pair) => pair,
+        Err(error) => {
+            if as_json {
+                print_json(&json_error_value(&error, None));
+            } else {
+                report_error(&error);
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+    let ((neg_a, a), (neg_b, b)) = parsed;
+    let plan = graymul_core::explain::explain_bigints(&a, &b, neg_a, neg_b, &options);
+    if as_json {
+        print_json(&plan.to_json_value());
+    } else {
+        for line in plan.report_lines(a_text, b_text) {
+            println!("{line}");
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 fn run_single(cli: &Cli) -> ExitCode {
@@ -513,19 +583,113 @@ mod tests {
 
     #[test]
     fn parse_decimal_accepts_plain_and_padded_digits() {
-        assert_eq!(parse_decimal("0").expect("zero"), BigUint::from(0u32));
+        assert_eq!(parse_decimal("0").expect("zero").1, BigUint::from(0u32));
         assert_eq!(
-            parse_decimal("  12345  ").expect("padded"),
+            parse_decimal("  12345  ").expect("padded").1,
             BigUint::from(12345u32)
         );
-        assert_eq!(parse_decimal("+12").expect("plus"), BigUint::from(12u32));
+        assert_eq!(parse_decimal("+12").expect("plus").1, BigUint::from(12u32));
+        assert!(!parse_decimal("+12").expect("plus").0);
+        assert_eq!(parse_decimal("-12").expect("minus").1, BigUint::from(12u32));
+        assert!(parse_decimal("-12").expect("minus").0);
+        assert_eq!(
+            parse_decimal("  -007  ").expect("padded minus").1,
+            BigUint::from(7u32)
+        );
+        assert!(parse_decimal("  -007  ").expect("padded minus").0);
     }
 
     #[test]
-    fn parse_decimal_rejects_blank_negative_and_alpha() {
-        for text in ["", "   ", "-5", "abc", "12x34"] {
+    fn parse_decimal_rejects_blank_and_alpha() {
+        for text in ["", "   ", "-", "+", "abc", "12x34", "--5", "- 5"] {
             assert!(parse_decimal(text).is_err(), "text {text} should fail");
         }
+    }
+
+    #[test]
+    fn multiply_pair_applies_boundary_sign() {
+        let options = MultiplyOptions::default();
+        let token = CancellationToken::new();
+        let (result, _) = multiply_pair("-12", "34", &options, &token, false);
+        assert_eq!(result.expect("neg times pos").product, "-408");
+        let (result, _) = multiply_pair("12", "-34", &options, &token, false);
+        assert_eq!(result.expect("pos times neg").product, "-408");
+        let (result, _) = multiply_pair("-12", "-34", &options, &token, false);
+        assert_eq!(result.expect("neg times neg").product, "408");
+        let (result, _) = multiply_pair("-0", "5", &options, &token, false);
+        assert_eq!(result.expect("neg zero").product, "0");
+        let (result, _) = multiply_pair("0", "-5", &options, &token, false);
+        assert_eq!(result.expect("zero times neg").product, "0");
+        let (result, _) = multiply_pair("-0", "-0", &options, &token, false);
+        assert_eq!(result.expect("neg zero times neg zero").product, "0");
+    }
+
+    #[test]
+    fn multiply_pair_accepts_padded_signed_inputs() {
+        let options = MultiplyOptions::default();
+        let token = CancellationToken::new();
+        let (result, _) = multiply_pair("  +12  ", "  34 ", &options, &token, false);
+        assert_eq!(result.expect("padded plus").product, "408");
+        let (result, _) = multiply_pair("  -12  ", "  34 ", &options, &token, false);
+        assert_eq!(result.expect("padded minus").product, "-408");
+    }
+
+    #[test]
+    fn batch_mixed_sign_continue_records_per_line_taxonomy() {
+        let options = MultiplyOptions::default();
+        let token = CancellationToken::new();
+        let lines = vec![
+            "-12 34".to_string(),
+            "-12 -34".to_string(),
+            "abc def".to_string(),
+            "-0 5".to_string(),
+        ];
+        let mut records = Vec::new();
+        let completed = run_batch_lines(&lines, &options, &token, false, true, &mut |record| {
+            records.push(batch_record_value(record));
+        });
+        assert!(completed);
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0]["status"], "ok");
+        assert_eq!(records[0]["product"], "-408");
+        assert_eq!(records[1]["status"], "ok");
+        assert_eq!(records[1]["product"], "408");
+        assert_eq!(records[2]["status"], "error");
+        assert!(records[2]["product"].is_null());
+        assert!(
+            records[2]["error"]
+                .as_str()
+                .expect("error string")
+                .starts_with("input:")
+        );
+        assert_eq!(records[3]["status"], "ok");
+        assert_eq!(records[3]["product"], "0");
+    }
+
+    #[test]
+    fn multiply_pair_large_magnitude_negative_keeps_sign() {
+        let options = MultiplyOptions::default();
+        let token = CancellationToken::new();
+        let big = format!("-{}", "9".repeat(5000));
+        let (result, _) = multiply_pair(&big, "1", &options, &token, false);
+        let report = result.expect("large magnitude");
+        assert_eq!(report.product, format!("-{}", "9".repeat(5000)));
+    }
+
+    #[test]
+    fn json_report_carries_sign_prefix_and_round_trips() {
+        let options = MultiplyOptions::default();
+        let token = CancellationToken::new();
+        let (result, _) = multiply_pair("-12345", "67890", &options, &token, false);
+        let report = result.expect("signed run");
+        assert_eq!(report.product, "-838102050");
+        let value = json_report_value(&report, "-12345", "67890", None);
+        assert_eq!(value["product"], "-838102050");
+        assert_eq!(value["input_a"], "-12345");
+        assert_eq!(value["input_b"], "67890");
+        let text = value.to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("round trip");
+        assert_eq!(parsed, value);
     }
 
     #[test]
@@ -829,9 +993,101 @@ mod tests {
                 assert!(jsonl);
                 assert!(continue_on_error);
             }
+            Commands::Explain { .. } => panic!("expected batch subcommand"),
         }
         assert!(cli.a.is_none());
         assert!(cli.b.is_none());
+    }
+
+    #[test]
+    fn cli_explain_subcommand_parses_operands_and_json_flag() {
+        let cli = Cli::try_parse_from(["graymul", "explain", "12", "-34", "--json"])
+            .expect("parse explain subcommand");
+        match cli.command.expect("explain command present") {
+            Commands::Explain { a, b, json } => {
+                assert_eq!(a, "12");
+                assert_eq!(b, "-34");
+                assert!(json);
+            }
+            _ => panic!("expected explain subcommand"),
+        }
+        assert!(cli.a.is_none());
+        assert!(cli.b.is_none());
+        let plain = Cli::try_parse_from(["graymul", "explain", "12", "34"])
+            .expect("parse explain without json");
+        match plain.command.expect("explain command present") {
+            Commands::Explain { a, b, json } => {
+                assert_eq!((a.as_str(), b.as_str()), ("12", "34"));
+                assert!(!json);
+            }
+            _ => panic!("expected explain subcommand"),
+        }
+    }
+
+    #[test]
+    fn explain_json_mirrors_plan_record() {
+        let ((_, a), (_, b)) = parse_decimal("12345")
+            .and_then(|a| parse_decimal("67890").map(|b| (a, b)))
+            .expect("operands");
+        let options = MultiplyOptions::default();
+        let plan = graymul_core::explain::explain_bigints(&a, &b, false, false, &options);
+        let value = plan.to_json_value();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .expect("plan object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["dispatch", "operands", "resources", "verification"]
+        );
+        assert_eq!(value["operands"]["limbs_a"], 1);
+        assert_eq!(value["operands"]["limbs_b"], 1);
+        assert_eq!(value["operands"]["negative"], false);
+        let text = value.to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("round trip");
+        assert_eq!(parsed, value);
+        let lines = plan.report_lines("12345", "67890");
+        assert_eq!(lines.len(), 7);
+        assert!(lines[4].starts_with("warmed_override: "));
+    }
+
+    #[test]
+    fn explain_negative_inputs_report_sign() {
+        let ((neg_a, a), (neg_b, b)) = parse_decimal("-12345")
+            .and_then(|a| parse_decimal("67890").map(|b| (a, b)))
+            .expect("operands");
+        assert!(neg_a);
+        assert!(!neg_b);
+        let plan = graymul_core::explain::explain_bigints(
+            &a,
+            &b,
+            neg_a,
+            neg_b,
+            &MultiplyOptions::default(),
+        );
+        assert!(plan.operands.negative);
+        assert_eq!(plan.to_json_value()["operands"]["negative"], true);
+    }
+
+    #[test]
+    fn explain_static_route_matches_routing_table_spot_check() {
+        let check = |limbs: usize| {
+            let expected = graymul_core::routing_table::route_for_limbs(limbs)
+                .expect("routed")
+                .name()
+                .to_string();
+            let plan = graymul_core::explain::explain_plan(limbs, 128, &MultiplyOptions::default());
+            assert_eq!(plan.dispatch.static_route, expected, "limbs {limbs}");
+        };
+        check(1);
+        check(64);
+        check(1024);
+        check(2048);
+        check(8192);
+        check(16384);
     }
 
     #[test]

@@ -1,0 +1,7 @@
+.wrap{max-width:720px;margin:2rem auto;font-family:system-ui,sans-serif}
+.warn{color:#8a4b00}
+.note{color:#444}
+.controls{display:grid;gap:.5rem;margin:1rem 0}
+.buttons{display:flex;gap:.5rem}
+dl{display:grid;grid-template-columns:180px 1fr;gap:.25rem .75rem}
+pre{background:#f4f4f4;padding:1rem;overflow:auto}

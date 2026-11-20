@@ -1,6 +1,7 @@
 use crate::cascade::{
-    DISPATCH_FRACTION, ReclaimStep, TrancheState, cap_slice, margin_clears_variance, plan_reclaim,
-    project_cost_ms, project_cost_raw_ns, reclaim_note, should_switch, tranche_first_box,
+    DISPATCH_FRACTION, ReclaimStep, TrancheState, cap_slice, estimate_live_bytes,
+    margin_clears_variance, plan_reclaim, project_cost_ms, project_cost_raw_ns, reclaim_note,
+    should_switch, tranche_first_box,
 };
 use crate::dispatch::{Engine, MulSignals};
 use crate::error::MultiplyError;
@@ -11,8 +12,12 @@ use crate::verify::verify_mod;
 use num_bigint::BigUint;
 use num_traits::Zero;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Duration;
+
+use crate::time::Instant;
 
 pub const PILOT_LIMBS: usize = 64;
 pub const TIE_BAND: f64 = 0.01;
@@ -42,9 +47,9 @@ pub(crate) fn run_engine_cancelled(
         Engine::Toom3 => crate::toom::mul_cancelled(a, b, cancelled),
         Engine::Toom4 => crate::toom::mul_toom4_cancelled(a, b, cancelled),
         Engine::Ssa => crate::schonhage::mul_cancelled(a, b, cancelled),
-        Engine::Furer => Ok(crate::furer::mul(a, b)),
-        Engine::Hvh => Ok(crate::hvh::mul(a, b)),
-        Engine::HvhFull => Ok(crate::hvh_full::mul(a, b)),
+        Engine::Furer => crate::furer::mul_cancelled(a, b, cancelled),
+        Engine::Hvh => crate::hvh::mul_cancelled(a, b, cancelled),
+        Engine::HvhFull => crate::hvh_full::mul_cancelled(a, b, cancelled),
     }
 }
 
@@ -192,16 +197,12 @@ fn run_tranche(
             )
         }
         Some(box_ms) => {
-            let start = Instant::now();
-            let work_a = a.to_vec();
-            let work_b = b.to_vec();
-            let (tx, rx) = mpsc::channel();
-            std::thread::spawn(move || {
-                let _ = tx.send(run_engine(engine, &work_a, &work_b));
-            });
-            let wait = Duration::from_millis(box_ms.min(u64::MAX as u128) as u64);
-            match rx.recv_timeout(wait) {
-                Ok(out) => finish_run(
+            #[cfg(target_arch = "wasm32")]
+            {
+                let _ = box_ms;
+                let start = Instant::now();
+                let out = run_engine_cancelled(engine, a, b, cancelled)?;
+                return finish_run(
                     engine,
                     a,
                     b,
@@ -214,14 +215,58 @@ fn run_tranche(
                     on_event,
                     current,
                     total,
-                ),
-                Err(mpsc::RecvTimeoutError::Timeout) => Err(MultiplyError::ResourceLimit(
-                    "tranche box exceeded".to_string(),
-                )),
-                Err(mpsc::RecvTimeoutError::Disconnected) => Err(MultiplyError::Internal(format!(
-                    "{} worker failed",
-                    engine.name()
-                ))),
+                );
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let start = Instant::now();
+                let flag = AtomicBool::new(cancelled.load(Ordering::Relaxed));
+                let (tx, rx) = mpsc::channel();
+                let outcome = std::thread::scope(|s| {
+                    let worker = s.spawn(|| {
+                        let result = run_engine_cancelled(engine, a, b, &flag);
+                        let _ = tx.send(result);
+                    });
+                    let wait = Duration::from_millis(box_ms.min(u64::MAX as u128) as u64);
+                    match rx.recv_timeout(wait) {
+                        Ok(result) => {
+                            let _ = worker.join();
+                            Some(result)
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            flag.store(true, Ordering::Relaxed);
+                            let _ = worker.join();
+                            None
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            let _ = worker.join();
+                            Some(Err(MultiplyError::Internal(format!(
+                                "{} worker failed",
+                                engine.name()
+                            ))))
+                        }
+                    }
+                });
+                match outcome {
+                    Some(Ok(out)) => finish_run(
+                        engine,
+                        a,
+                        b,
+                        out,
+                        start.elapsed().as_nanos(),
+                        winner,
+                        tranche,
+                        signals,
+                        timings,
+                        on_event,
+                        current,
+                        total,
+                    ),
+                    Some(Err(error)) => Err(error),
+                    None => Err(MultiplyError::ResourceLimit(
+                        "tranche box exceeded".to_string(),
+                    )),
+                }
             }
         }
     }
@@ -257,19 +302,19 @@ fn try_race_skip_tier(
     let mut max_cv = 0.0f64;
     let mut cached = 0usize;
     for engine in Engine::all() {
-        if crate::rate_cache::sample_count(engine.name()) < 3 {
+        if crate::rate_cache::sample_count_for_limbs(engine.name(), full_limbs) < 3 {
             continue;
         }
-        let Some(rate) = crate::rate_cache::get(engine.name()) else {
+        let Some(coeff) = crate::rate_cache::get_for_limbs(engine.name(), full_limbs) else {
             continue;
         };
-        let Some(spread) = crate::rate_cache::cv(engine.name()) else {
+        let Some(spread) = crate::rate_cache::cv_for_limbs(engine.name(), full_limbs) else {
             continue;
         };
-        let Some(raw) = project_cost_raw_ns(engine, full_limbs, rate) else {
+        let Some(raw) = project_cost_raw_ns(engine, full_limbs, coeff) else {
             continue;
         };
-        signals.measured_ns_per_limb.insert(engine.name(), rate);
+        signals.record_coeff(engine.name(), full_limbs, coeff);
         if spread > max_cv {
             max_cv = spread;
         }
@@ -300,6 +345,24 @@ fn try_race_skip_tier(
     }
 }
 
+fn cpu_elapsed_ns(start: Instant, workers: usize) -> u128 {
+    start
+        .elapsed()
+        .as_nanos()
+        .saturating_mul(workers.max(1) as u128)
+}
+
+fn cpu_trip(cpu_spent_ns: u128, cpu_budget_ns: Option<u128>) -> Result<(), MultiplyError> {
+    if let Some(budget) = cpu_budget_ns {
+        if cpu_spent_ns > budget {
+            return Err(MultiplyError::ResourceLimit(
+                "cpu budget exceeded".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn pilot_race(
     a_limbs: &[u64],
@@ -310,9 +373,12 @@ fn pilot_race(
     timings: Option<&TimingCollector>,
     on_event: &mut dyn FnMut(&ProgressEvent) -> Result<(), MultiplyError>,
     budget_bytes: u64,
+    cpu_budget_ms: Option<u128>,
 ) -> Result<(Engine, Vec<u64>), MultiplyError> {
     let total = Engine::all().len() + 1;
     let mut current = 0;
+    let cpu_budget_ns = cpu_budget_ms.map(|ms| ms.saturating_mul(1_000_000));
+    let mut cpu_spent_ns: u128 = 0;
     let pilot_a = pilot_limbs(a_limbs);
     let pilot_b = pilot_limbs(b_limbs);
     let pilot_budget_ms =
@@ -396,10 +462,12 @@ fn pilot_race(
                 break;
             }
             current += 1;
-            if crate::rate_cache::sample_count(engine.name()) >= crate::rate_cache::CACHED_SAMPLES
-                && let Some(rate) = crate::rate_cache::get(engine.name())
+            let pilot_limbs = pilot_a.len().max(pilot_b.len());
+            if crate::rate_cache::sample_count_for_limbs(engine.name(), pilot_limbs)
+                >= crate::rate_cache::CACHED_SAMPLES
+                && let Some(coeff) = crate::rate_cache::get_for_limbs(engine.name(), pilot_limbs)
             {
-                signals.measured_ns_per_limb.insert(engine.name(), rate);
+                signals.record_coeff(engine.name(), pilot_limbs, coeff);
                 skipped += 1;
                 on_event(&ProgressEvent {
                     stage: engine.name().to_string(),
@@ -414,10 +482,13 @@ fn pilot_race(
                 continue;
             }
             piloted += 1;
+            let cpu_start = Instant::now();
             run_tranche(
                 engine, pilot_a, pilot_b, None, 1, false, signals, timings, on_event, current,
                 total, cancelled,
             )?;
+            cpu_spent_ns = cpu_spent_ns.saturating_add(cpu_elapsed_ns(cpu_start, signals.workers));
+            cpu_trip(cpu_spent_ns, cpu_budget_ns)?;
         }
         if piloted == 0 && skipped > 0 {
             if let Some(collector) = timings {
@@ -448,6 +519,12 @@ fn pilot_race(
     let plan = plan_reclaim(signals.limbs_max, winner, signals.workers, budget_bytes);
     let winner = plan.engine;
     signals.workers = plan.workers;
+    if plan.budget_bytes > 0 && plan.live_bytes > plan.budget_bytes {
+        return Err(MultiplyError::ResourceLimit(format!(
+            "memory budget exceeded live_bytes={} budget_bytes={}",
+            plan.live_bytes, plan.budget_bytes
+        )));
+    }
     if plan.step != ReclaimStep::None {
         if let Some(collector) = timings {
             collector.record_elapsed("reclaim", None, 0, reclaim_note(&plan));
@@ -459,10 +536,14 @@ fn pilot_race(
     check_running(deadline, cancelled)?;
     current += 1;
     let tranche_start = Instant::now();
-    match run_tranche(
+    let cpu_start = Instant::now();
+    let first = run_tranche(
         winner, a_limbs, b_limbs, first_box, 1, true, signals, timings, on_event, current, total,
         cancelled,
-    ) {
+    );
+    cpu_spent_ns = cpu_spent_ns.saturating_add(cpu_elapsed_ns(cpu_start, signals.workers));
+    cpu_trip(cpu_spent_ns, cpu_budget_ns)?;
+    match first {
         Ok(out) => {
             tranche.record_attempt(tranche_start.elapsed().as_millis(), true);
             tranche.winner = Some(winner.name().to_string());
@@ -514,10 +595,14 @@ fn pilot_race(
             current += 1;
             let total_two = total + tranche.attempts as usize;
             let second_start = Instant::now();
+            let cpu_start_two = Instant::now();
             let out = run_tranche(
                 second, a_limbs, b_limbs, box_two, 2, true, signals, timings, on_event, current,
                 total_two, cancelled,
             )?;
+            cpu_spent_ns =
+                cpu_spent_ns.saturating_add(cpu_elapsed_ns(cpu_start_two, signals.workers));
+            cpu_trip(cpu_spent_ns, cpu_budget_ns)?;
             tranche.record_attempt(second_start.elapsed().as_millis(), true);
             tranche.winner = Some(second.name().to_string());
             check_running(deadline, cancelled)?;
@@ -580,7 +665,16 @@ pub fn multiply_with_progress(
         if name != "auto" {
             let engine = Engine::from_str(name)
                 .ok_or_else(|| MultiplyError::Input(format!("unsupported algorithm {name}")))?;
+            let budget_bytes = options.memory_budget_bytes();
+            let live_bytes = estimate_live_bytes(signals.limbs_max, engine.name(), signals.workers);
+            if live_bytes > budget_bytes {
+                return Err(MultiplyError::ResourceLimit(format!(
+                    "memory budget exceeded live_bytes={} budget_bytes={}",
+                    live_bytes, budget_bytes
+                )));
+            }
             check_running(deadline, cancelled)?;
+            let cpu_start = Instant::now();
             let out = run_tranche(
                 engine,
                 &a_limbs,
@@ -595,6 +689,14 @@ pub fn multiply_with_progress(
                 1,
                 cancelled,
             )?;
+            if let Some(cpu_ms) = options.cpu_budget_ms() {
+                let spent_ns = cpu_elapsed_ns(cpu_start, signals.workers);
+                if spent_ns > cpu_ms.saturating_mul(1_000_000) {
+                    return Err(MultiplyError::ResourceLimit(
+                        "cpu budget exceeded".to_string(),
+                    ));
+                }
+            }
             check_running(deadline, cancelled)?;
             return Ok(MultiplyReport {
                 product: limb::to_bigint(&out).to_string(),
@@ -613,6 +715,7 @@ pub fn multiply_with_progress(
         timings,
         on_event,
         options.memory_budget_bytes(),
+        options.cpu_budget_ms(),
     )?;
     Ok(MultiplyReport {
         product: limb::to_bigint(&out).to_string(),
@@ -818,6 +921,62 @@ mod tests {
     }
 
     #[test]
+    fn box_path_honors_precancelled_flag() {
+        let mut rng = ChaCha8Rng::seed_from_u64(0x9e3779b97f4a7c66);
+        let (a, b) = fixture(&mut rng, 300);
+        let ala = limb::from_bigint(&a);
+        let blb = limb::from_bigint(&b);
+        let flag = AtomicBool::new(true);
+        let mut signals = MulSignals::collect(300, 300, 19200, None);
+        let mut on_event = |_: &ProgressEvent| Ok(());
+        let result = run_tranche(
+            Engine::Schoolbook,
+            &ala,
+            &blb,
+            Some(60_000),
+            1,
+            true,
+            &mut signals,
+            None,
+            &mut on_event,
+            1,
+            1,
+            &flag,
+        );
+        assert!(matches!(result, Err(MultiplyError::Cancelled(_))));
+    }
+
+    #[test]
+    fn box_timeout_is_resource_limit_and_tree_stays_usable() {
+        let _guard = lock_for_tests();
+        let mut rng = ChaCha8Rng::seed_from_u64(0x9e3779b97f4a7c67);
+        let (a, b) = fixture(&mut rng, 2048);
+        let ala = limb::from_bigint(&a);
+        let blb = limb::from_bigint(&b);
+        let flag = AtomicBool::new(false);
+        let mut signals = MulSignals::collect(2048, 2048, 131072, None);
+        let mut on_event = |_: &ProgressEvent| Ok(());
+        let result = run_tranche(
+            Engine::Toom4,
+            &ala,
+            &blb,
+            Some(1),
+            1,
+            true,
+            &mut signals,
+            None,
+            &mut on_event,
+            1,
+            1,
+            &flag,
+        );
+        assert!(matches!(result, Err(MultiplyError::ResourceLimit(_))));
+        let report = multiply(&a, &b, &auto_options()).expect("tree usable after timeout");
+        let expected = limb::to_bigint(&crate::schoolbook::mul(&ala, &blb)).to_string();
+        assert_eq!(report.product, expected);
+    }
+
+    #[test]
     fn precancelled_is_cancelled() {
         let flag = AtomicBool::new(true);
         assert!(matches!(
@@ -1004,7 +1163,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(0x9e3779b97f4a7c55);
         let (a, b) = fixture(&mut rng, 9000);
         let options = MultiplyOptions {
-            max_memory_mb: Some(1),
+            max_memory_mb: Some(8),
             threads: Some(2),
             ..MultiplyOptions::default()
         };
@@ -1016,6 +1175,94 @@ mod tests {
         .to_string();
         assert_eq!(report.product, expected);
         assert!(Engine::from_str(&report.method).is_some());
+    }
+
+    #[test]
+    fn tiny_memory_budget_rejects_explicit_before_compute() {
+        let _guard = lock_for_tests();
+        let mut rng = ChaCha8Rng::seed_from_u64(0x9e3779b97f4a7c80);
+        let (a, b) = fixture(&mut rng, 2048);
+        let options = MultiplyOptions {
+            algorithm: Some("schoolbook".to_string()),
+            threads: Some(1),
+            max_memory_mb: Some(1),
+            ..MultiplyOptions::default()
+        };
+        assert!(matches!(
+            multiply(&a, &b, &options),
+            Err(MultiplyError::ResourceLimit(_))
+        ));
+    }
+
+    #[test]
+    fn fitting_memory_budget_runs_with_verified_product() {
+        let _guard = lock_for_tests();
+        let mut rng = ChaCha8Rng::seed_from_u64(0x9e3779b97f4a7c81);
+        let (a, b) = fixture(&mut rng, 64);
+        let options = MultiplyOptions {
+            threads: Some(1),
+            max_memory_mb: Some(512),
+            ..MultiplyOptions::default()
+        };
+        let report = multiply(&a, &b, &options).expect("fitting budget runs");
+        let expected = limb::to_bigint(&schoolbook::mul(
+            &limb::from_bigint(&a),
+            &limb::from_bigint(&b),
+        ))
+        .to_string();
+        assert_eq!(report.product, expected);
+    }
+
+    #[test]
+    fn zero_cpu_budget_trips_on_explicit_work() {
+        let _guard = lock_for_tests();
+        let mut rng = ChaCha8Rng::seed_from_u64(0x9e3779b97f4a7c82);
+        let (a, b) = fixture(&mut rng, 2048);
+        let options = MultiplyOptions {
+            algorithm: Some("schoolbook".to_string()),
+            threads: Some(1),
+            max_cpu_seconds: Some(0),
+            ..MultiplyOptions::default()
+        };
+        assert!(matches!(
+            multiply(&a, &b, &options),
+            Err(MultiplyError::ResourceLimit(_))
+        ));
+    }
+
+    #[test]
+    fn absent_cpu_budget_runs_same_work() {
+        let _guard = lock_for_tests();
+        let mut rng = ChaCha8Rng::seed_from_u64(0x9e3779b97f4a7c82);
+        let (a, b) = fixture(&mut rng, 2048);
+        let options = MultiplyOptions {
+            algorithm: Some("schoolbook".to_string()),
+            threads: Some(1),
+            ..MultiplyOptions::default()
+        };
+        let report = multiply(&a, &b, &options).expect("no cpu budget runs");
+        let expected = limb::to_bigint(&schoolbook::mul(
+            &limb::from_bigint(&a),
+            &limb::from_bigint(&b),
+        ))
+        .to_string();
+        assert_eq!(report.product, expected);
+    }
+
+    #[test]
+    fn zero_cpu_budget_trips_on_auto_path() {
+        let _guard = lock_for_tests();
+        let mut rng = ChaCha8Rng::seed_from_u64(0x9e3779b97f4a7c83);
+        let (a, b) = fixture(&mut rng, 512);
+        let options = MultiplyOptions {
+            threads: Some(1),
+            max_cpu_seconds: Some(0),
+            ..MultiplyOptions::default()
+        };
+        assert!(matches!(
+            multiply(&a, &b, &options),
+            Err(MultiplyError::ResourceLimit(_))
+        ));
     }
 
     fn pilot_runs(records: &[crate::report::StageTiming]) -> usize {
@@ -1108,16 +1355,16 @@ mod tests {
     }
 
     fn seed_schoolbook_cache() {
-        crate::rate_cache::observe("schoolbook", 100, 20_000);
-        crate::rate_cache::observe("schoolbook", 100, 20_000);
-        crate::rate_cache::observe("schoolbook", 100, 20_000);
+        crate::rate_cache::observe("schoolbook", 2, 80);
+        crate::rate_cache::observe("schoolbook", 2, 80);
+        crate::rate_cache::observe("schoolbook", 2, 80);
         for engine in Engine::all() {
             if engine == Engine::Schoolbook {
                 continue;
             }
-            crate::rate_cache::observe(engine.name(), 100, 1_900_000);
-            crate::rate_cache::observe(engine.name(), 100, 2_000_000);
-            crate::rate_cache::observe(engine.name(), 100, 2_100_000);
+            crate::rate_cache::observe(engine.name(), 2, 1_900_000);
+            crate::rate_cache::observe(engine.name(), 2, 2_000_000);
+            crate::rate_cache::observe(engine.name(), 2, 2_100_000);
         }
     }
 
@@ -1178,15 +1425,15 @@ mod tests {
 
     fn seed_full_cache_schoolbook_dominant() {
         for _ in 0..3 {
-            crate::rate_cache::observe("schoolbook", 100, 10_000);
+            crate::rate_cache::observe("schoolbook", 1024, 10_000);
         }
         for engine in Engine::all() {
             if engine == Engine::Schoolbook {
                 continue;
             }
-            crate::rate_cache::observe(engine.name(), 100, 1_900_000);
-            crate::rate_cache::observe(engine.name(), 100, 2_000_000);
-            crate::rate_cache::observe(engine.name(), 100, 2_100_000);
+            crate::rate_cache::observe(engine.name(), 1024, 1_900_000);
+            crate::rate_cache::observe(engine.name(), 1024, 2_000_000);
+            crate::rate_cache::observe(engine.name(), 1024, 2_100_000);
         }
     }
 
@@ -1196,7 +1443,7 @@ mod tests {
         reset_for_tests();
         seed_full_cache_schoolbook_dominant();
         for engine in Engine::all() {
-            assert!(crate::rate_cache::sample_count(engine.name()) >= 3);
+            assert!(crate::rate_cache::sample_count_for_limbs(engine.name(), 1024) >= 3);
         }
         let mut rng = ChaCha8Rng::seed_from_u64(0x9e3779b97f4a7c67);
         let (a, b) = fixture(&mut rng, 1024);
@@ -1348,6 +1595,32 @@ mod tests {
                 .iter()
                 .any(|record| record.detail.contains("static-route"))
         );
+    }
+
+    #[test]
+    fn cold_winners_match_static_table_across_bands() {
+        let _guard = lock_for_tests();
+        for limbs in [1usize, 2, 63, 64, 65, 128, 256, 1024, 2049] {
+            reset_for_tests();
+            let width = limbs.max(1);
+            let a_limbs = vec![0x9E3779B97F4A7C51u64; width];
+            let b_limbs = vec![0xC2B2AE3D27D4EB4Fu64; width];
+            let a = limb::to_bigint(&a_limbs);
+            let b = limb::to_bigint(&b_limbs);
+            let expected = crate::routing_table::route_for_limbs(width)
+                .expect("static band covers size")
+                .name();
+            let collector = TimingCollector::new();
+            let report = run_auto(&a, &b, &collector);
+            assert_eq!(report.method, expected, "cold limbs={width}");
+            assert_eq!(report.limbs, width);
+            let records = collector.snapshot();
+            assert!(
+                records
+                    .iter()
+                    .any(|record| record.detail.contains("static-route"))
+            );
+        }
     }
 
     #[test]

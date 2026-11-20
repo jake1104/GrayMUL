@@ -30,7 +30,7 @@ def check_repo(root):
     pyproject_path = root / "pyproject.toml"
     test_path = root / "python" / "tests" / "test_mul.py"
     pins_path = root / "bench" / "pins.json"
-    crate_names = ["graymul-core", "graymul-cli", "graymul-py", "graymul-bench"]
+    crate_names = ["graymul-core", "graymul-cli", "graymul-py", "graymul-bench", "graymul-wasm"]
 
     results = []
 

@@ -45,4 +45,12 @@ def multiply_report_decimal(
     max_cpu_seconds: int | None = ...,
     perf_mode: bool = ...,
 ) -> dict[str, Any]: ...
+def explain_decimal(
+    a: str,
+    b: str,
+    threads: int | None = ...,
+    timeout_seconds: int | None = ...,
+    max_memory_mb: int | None = ...,
+    max_cpu_seconds: int | None = ...,
+) -> dict[str, Any]: ...
 def version() -> str: ...

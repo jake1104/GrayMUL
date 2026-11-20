@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 import graymul
@@ -46,10 +48,51 @@ def test_multiply_rejects_bool_with_type_error() -> None:
         graymul.multiply("12", 3)  # type: ignore[arg-type]
 
 
-def test_multiply_rejects_negative_with_input_error() -> None:
+def test_multiply_signed_combinations() -> None:
+    assert graymul.multiply(-5, 3) == -15
+    assert graymul.multiply(5, -3) == -15
+    assert graymul.multiply(-5, -3) == 15
+    assert graymul.multiply(-12, 34) == -408
+    assert graymul.multiply(-123456789, 987654321) == -121932631112635269
+    assert graymul.multiply(-123456789, -987654321) == 121932631112635269
+
+
+def test_multiply_signed_zero_normalizes() -> None:
+    assert graymul.multiply(0, -5) == 0
+    assert graymul.multiply(-5, 0) == 0
+    assert str(graymul.multiply(0, -5)) == "0"
+    report = graymul.multiply_report(0, -5)
+    assert report["product"] == 0
+
+
+def test_multiply_report_signed_product_and_timings() -> None:
+    report = graymul.multiply_report(-12, 34)
+    assert report["product"] == -408
+    assert report["method"] in REAL_METHODS
+    assert report["limbs"] == 1
+    assert any(entry["stage"] == report["method"] for entry in report["timings"])
+    negated = graymul.multiply_report(-12, -34)
+    assert negated["product"] == 408
+    entries = graymul.stage_timings(-12, 34)
+    assert any(entry["stage"] == "pilot" for entry in entries)
+
+
+def test_multiply_with_progress_signed() -> None:
+    assert graymul.multiply_with_progress(-12, 34, lambda event: True) == -408
+    assert graymul.multiply_with_progress(-12, -34, lambda event: True) == 408
+
+
+def test_multiply_batch_mixed_sign() -> None:
+    assert graymul.multiply_batch([(-2, 3), (2, -3), (-2, -3), (0, -5)]) == [-6, -6, 6, 0]
+
+
+def test_multiply_large_magnitude_negative_capped() -> None:
     with pytest.raises(graymul.GrayMULError) as excinfo:
-        graymul.multiply(-5, 3)
+        graymul.multiply(-(10**5000), 3)
     assert excinfo.value.category == "input"
+    with pytest.raises(graymul.GrayMULError) as product_info:
+        graymul.multiply(10**2500, -(10**2500))
+    assert product_info.value.category == "input"
 
 
 def test_multiply_unknown_algorithm_is_input_error() -> None:
@@ -127,9 +170,10 @@ def test_stage_timings_shape() -> None:
 
 
 def test_multiply_batch_fail_fast_and_record() -> None:
+    big = 10**5000
     with pytest.raises(graymul.GrayMULError):
-        graymul.multiply_batch([(2, 3), (-1, 5), (4, 5)])
-    results = graymul.multiply_batch([(2, 3), (-1, 5), (4, 5)], fail_fast=False)
+        graymul.multiply_batch([(2, 3), (big, 5), (4, 5)])
+    results = graymul.multiply_batch([(2, 3), (big, 5), (4, 5)], fail_fast=False)
     assert results[0] == 6
     assert isinstance(results[1], graymul.GrayMULError)
     assert results[1].category == "input"
@@ -137,7 +181,7 @@ def test_multiply_batch_fail_fast_and_record() -> None:
 
 
 def test_version() -> None:
-    assert graymul.version() == "0.1.0"
+    assert graymul.version() == "0.1.1"
 
 
 def test_oversized_int_maps_to_input_category() -> None:
@@ -161,3 +205,60 @@ def test_docstrings_make_no_ignored_threads_claim() -> None:
     for func in funcs:
         assert func.__doc__ is not None
         assert "ignor" not in func.__doc__
+
+
+def test_explain_schema_pins_exact_key_sets() -> None:
+    plan = graymul.explain(12345, 67890)
+    assert sorted(plan.keys()) == ["dispatch", "operands", "resources", "verification"]
+    assert sorted(plan["operands"].keys()) == [
+        "limbs_a",
+        "limbs_b",
+        "limbs_max",
+        "negative",
+        "negative_a",
+        "negative_b",
+        "ratio",
+    ]
+    assert sorted(plan["dispatch"].keys()) == [
+        "reason",
+        "selected",
+        "static_route",
+        "warmed_override",
+    ]
+    assert sorted(plan["resources"].keys()) == [
+        "est_memory_bytes",
+        "timeout_ms",
+        "workers",
+    ]
+    assert sorted(plan["verification"].keys()) == ["methods"]
+    assert plan["operands"]["limbs_a"] == 1
+    assert plan["operands"]["limbs_b"] == 1
+    assert plan["operands"]["negative"] is False
+    assert plan["dispatch"]["reason"] in {"static-band", "warmed-override"}
+    assert plan["verification"]["methods"]
+    text = json.dumps(plan)
+    assert json.loads(text) == plan
+
+
+def test_explain_negative_inputs_report_sign() -> None:
+    plan = graymul.explain(-12, 34)
+    assert plan["operands"]["negative_a"] is True
+    assert plan["operands"]["negative_b"] is False
+    assert plan["operands"]["negative"] is True
+    even = graymul.explain(-12, -34)
+    assert even["operands"]["negative"] is False
+    assert json.loads(json.dumps(even)) == even
+
+
+def test_explain_matches_routing_table_spot_check() -> None:
+    plan = graymul.explain(10**50, 10**10)
+    assert plan["operands"]["limbs_max"] == max(
+        plan["operands"]["limbs_a"], plan["operands"]["limbs_b"]
+    )
+    assert plan["dispatch"]["reason"] in {"static-band", "warmed-override"}
+    assert plan["dispatch"]["reason"] != "ratio-rule"
+
+
+def test_explain_rejects_bool_with_type_error() -> None:
+    with pytest.raises(TypeError):
+        graymul.explain(True, 3)  # type: ignore[arg-type]

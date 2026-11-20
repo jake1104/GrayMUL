@@ -1,9 +1,9 @@
-# GrayMUL · [![Version](https://img.shields.io/badge/version-v0.1.0-blue.svg)](CHANGELOG.md) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](#license) [![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)](python/graymul/__init__.py)
+# GrayMUL · [![Version](https://img.shields.io/badge/version-v0.1.1-blue.svg)](https://github.com/jake1104/GrayMUL/releases) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](#license) [![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)](python/graymul/__init__.py)
 
 Pure-Rust Harvey–van der Hoeven integer multiplication with adaptive multi-engine dispatch; measured cost picks the engine and every product is verified.
 
 - **Adaptive dispatch:** schoolbook, Karatsuba, Toom-3, Toom-4, Schönhage–Strassen, Fürer, and Harvey–van der Hoeven share one ladder, plus an opt-in multivariate `hvh-full` engine. A static routing table owns the per-band choice, cold legs may run a pilot race, and projected-cost ties within 1% resolve toward `hvh`.
-- **Verified output:** every reported product passes a two-modulus check before it is returned. A wrong answer is a hard `internal` failure, never a silent one.
+- **Verified output:** every reported product passes a three-modulus check — residues against two 30-bit primes plus the 61-bit Mersenne prime — with a length pin before it is returned. A wrong answer is a hard `internal` failure, never a silent one.
 - **Budgets as errors:** time (`--timeout-seconds`) and memory (`--max-memory-mb`, default 1 GiB) end runs with a clean `resource-limit`, never an abort.
 - **Reproducible bench:** every bench run writes an archive envelope carrying its own provenance (`task_id`, tier, timeout, threads, seeds, timestamp).
 
@@ -13,6 +13,7 @@ The numeric backend is `num-bigint` / `num-traits` over `u64` limbs (no GMP). Th
 - [Installation](#installation)
 - [CLI usage](#cli-usage)
 - [Python usage](#python-usage)
+- [WebAssembly](#webassembly)
 - [Benchmarks](#benchmarks)
 - [Architecture](#architecture)
 - [Correctness](#correctness)
@@ -51,7 +52,7 @@ Prerequisites: a Rust stable toolchain plus a C compiler (the default allocator 
 cargo build -p graymul-cli --release
 .\target\release\graymul.exe 12345 67890
 python -m maturin build --release --out dist
-python -m pip install --force-reinstall --no-deps dist\graymul-0.1.0-cp38-abi3-win_amd64.whl
+python -m pip install --force-reinstall --no-deps dist\graymul-0.1.1-cp38-abi3-win_amd64.whl
 ```
 
 ## CLI usage
@@ -70,6 +71,22 @@ stage: pilot                degree: n/a  elapsed_ms: 0        static-route engin
 stage: schoolbook           degree: n/a  elapsed_ms: 0        engine=schoolbook limbs=1 winner=true tranche=1
 stage: verify               degree: n/a  elapsed_ms: 0        engine=schoolbook limbs=1 winner=true tranche=1 verify_ns=700
 ```
+
+### Negative inputs
+
+Operands accept an optional leading `+`/`-` sign; the sign never reaches the engine — the magnitude is multiplied and the sign reapplied, and `-0` normalizes to `0`. A leading `-` looks like a flag to the CLI, so pass `--` first:
+
+```text
+> graymul.exe -- -5 3
+A: -5
+B: 3
+product: -15
+method: schoolbook
+limbs: 1
+elapsed_ms: 0
+```
+
+Without `--`, `-5` exits 2 with a clap usage error. Magnitude limits ignore the sign: a 5000-digit operand multiplies the same way with or without a leading `-` (the Python digit cap likewise trips on magnitude, failing with `input` either way).
 
 ### JSON output
 
@@ -93,6 +110,23 @@ With `--progress`, per-event lines stream to stderr while stdout keeps the final
 ```
 
 Exit code is 0 only when every line succeeds; any failure — or a cancellation — exits 1.
+
+### Explaining the plan
+
+`graymul explain A B [--json]` prints the execution plan without multiplying: operand limbs and sign, the static-band route versus the warmed-cache override, resource estimates, and the verification methods.
+
+```text
+> graymul.exe --threads 4 explain 12345 67890
+input_a: 12345
+input_b: 67890
+operands: limbs_a=1 limbs_b=1 limbs_max=1 ratio=1.000 negative=false
+dispatch: static_route=schoolbook selected=schoolbook reason=static-band
+warmed_override: none
+resources: workers=4 est_memory_bytes=4194400 timeout_ms=3600000
+verification: methods=mod-check,length-pin
+```
+
+With `--json` the same plan is a single object with keys `operands`, `dispatch`, `resources`, `verification`. `static_route` is the cold-table band choice; `selected` differs only when `reason` is `warmed-override` (warmed rate data outvoted the table), and the override is always repeated on its own `warmed_override` line (`none` when the table stands).
 
 ### Interrupting a run
 
@@ -131,11 +165,13 @@ import graymul
 graymul.multiply(12345, 67890)                  # 838102050
 graymul.multiply(12345, 67890, algorithm="hvh")  # 838102050
 graymul.multiply_report(12345, 67890)["method"]  # 'schoolbook'
-graymul.version()                               # '0.1.0'
+graymul.version()                               # '0.1.1'
 graymul.stage_timings(12345, 67890)             # [{'stage': 'pilot', ...}, ...]
 ```
 
-All outputs above were verified live against the installed 0.1.0 wheel.
+All outputs above were verified live against the installed 0.1.1 wheel.
+
+Every entry point in this section (`multiply`, `multiply_with_progress`, `stage_timings`, `multiply_report`, `multiply_batch`, `explain`) accepts negative operands: the sign is carried outside the engine and reapplied to the product, and `-0` normalizes to `0` (verified: `multiply(-12, -34)` is `408`, `multiply_report(-12, 34)["method"]` is `'schoolbook'`). The error taxonomy is unchanged — an over-magnitude negative fails exactly like its positive twin, e.g. `multiply(-(10**5000), 3)` raises `GrayMULError` with category `input` (`Exceeds the limit (4300 digits) ...`).
 
 ### Python keywords at a glance
 
@@ -178,10 +214,28 @@ Traceback (most recent call last):
 graymul.GrayMULError: cancelled: the operation was cancelled
 ```
 
+### Explaining the plan
+
+`graymul.explain(a, b)` returns the execution plan as a dict with keys `operands`, `dispatch`, `resources`, `verification` — no multiplication runs. The `dispatch` section keeps the static band route (`static_route`) and the warmed-cache override (`warmed_override`, `None` when the table stands) on separate keys, with `reason` either `static-band` or `warmed-override`. Verified: `explain(12345, 67890)["dispatch"]` is `{'static_route': 'schoolbook', 'selected': 'schoolbook', 'reason': 'static-band', 'warmed_override': None}`, and `explain(-12, 34)["operands"]["negative"]` is `True`.
+
 ### Batch multiplication and determinism
 
 - **Batch:** `graymul.multiply_batch(pairs, fail_fast=True, ...)` multiplies a list of `(a, b)` pairs with the same keywords. It returns one product per pair; on failure it either raises (`fail_fast=True`) or records the `GrayMULError` in place (`False`). Verified: `multiply_batch([(12, 34), (7, 8)])` gives `[408, 56]`.
 - **Determinism:** `seed` pins the deterministic RNG — the same seed repeats the same run.
+
+## WebAssembly
+
+`crates/graymul-wasm` exposes two functions: `multiply(a, b, budgetMs)` and `version()`. A success returns JSON with keys `ok`, `inputA`, `inputB`, `product`, `method`, `limbs`, `elapsedMs`, `stages` (each stage carries `stage`, `degree`, `ms`, `detail`); a failure returns `ok`, `inputA`, `inputB`, `error`. Nonzero budgets clamp to 1000–10000 ms (`0` means no limit); the module pins threads to 1, memory to 512 MiB, and a fixed seed. `multiply` is synchronous and blocks the page — always call it from a Web Worker, never the main thread; `examples/wasm-demo` shows the worker wiring (`worker.js` posts `{id, a, b, budgetMs}`, `app.js` respawns the worker to cancel).
+
+```powershell
+wasm-pack build crates/graymul-wasm --target web --release --out-dir pkg
+node scripts/wasm-smoke.mjs
+```
+
+```text
+version: 0.1.1
+summary: 3/3 PASS failed 0
+```
 
 ## Benchmarks
 
@@ -211,7 +265,7 @@ Against an independent fast leg, Malachite 0.4.22 is faster than GrayMUL on all 
 
 The ssa entry is unproven: the loss gap narrows monotonically to a point estimate crossing inside (4096, 8192] limbs, but neither adjacent cell clears its band, so no crossing is claimed; the lone certified ssa win (0.72x at 32768, single top-edge cell) carries no routing change. A same-day, same-binary rerun moved ssa-vs-toom4 legs ~2x without changing the code — run-state variance dominates absolute legs, which is why only paired same-binary comparisons certify anything here. The 500–1000 limb crossover target from the literature band is missed: truncation never fires under power-of-two sizing, hand SIMD matches the autovectorizer, and Bailey blocking engages only at transform length 65536 and above.
 
-Routing bands (`bench/routing.json`): [1,64), [64,256), [256,1024) → schoolbook, conservative; [1024,2048) → toom3, certified; [2048,8192) → toom4, certified; [8192,16384), [16384,∞) → toom4, conservative. No band routes `ssa`, `furer`, `hvh`, or `hvh-full`: those engines are measured through explicit forcing, never through auto routing.
+Routing bands (`bench/routing.json`): [1,64), [64,256), [256,1024) → schoolbook, conservative; [1024,2048) → toom3, certified; [2048,8192) → toom4, certified; [8192,16384), [16384,∞) → toom4, conservative. No band routes `ssa`, `furer`, `hvh`, or `hvh-full`: those engines are measured through explicit forcing, never through auto routing. `--tier asym` (`--engines <A,B>` required) pits two engines against each other on asymmetric small×big limb pairs; it is measurement-only and never changes production routing.
 
 Pin corpus (`bench/pins.json`): five seeded cells, methods and limb counts pinned, time as upper bands only — never as pinned timings:
 
@@ -288,7 +342,7 @@ python -m pytest -q python/tests
 ```
 
 - Every engine cross-validates against schoolbook as oracle (randomized plus boundary pins: zero, one, `u64::MAX` carry chains, asymmetric lengths).
-- No output returns before the two-modulus `verify` check plus length pin passes. A wrong answer is a hard `internal` failure, never a silent one.
+- No output returns before the three-modulus `verify` check (two 30-bit primes, `1000000007`/`1000000009`, plus the 61-bit Mersenne `2305843009213693951`) plus the length pin (`product` limbs never exceed `a` limbs + `b` limbs) passes. A wrong answer is a hard `internal` failure, never a silent one.
 - `graymul-bench` tiers verify every answer against their deadlines:
 
 ```powershell
@@ -315,7 +369,7 @@ Release, wheel, and Python suite:
 ```powershell
 cargo build --release
 python -m maturin build --release --out dist
-python -m pip install --force-reinstall --no-deps dist\graymul-0.1.0-cp38-abi3-win_amd64.whl
+python -m pip install --force-reinstall --no-deps dist\graymul-0.1.1-cp38-abi3-win_amd64.whl
 python -m pytest -q python/tests
 ```
 
@@ -327,7 +381,7 @@ python -m pytest -q python/tests
 
 ## Release notes
 
-Release notes live in [CHANGELOG.md](CHANGELOG.md).
+Release notes ship with each published release — see [GitHub Releases](https://github.com/jake1104/GrayMUL/releases) for the per-version notes.
 
 ## License
 

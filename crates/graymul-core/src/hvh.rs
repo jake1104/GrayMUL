@@ -370,6 +370,196 @@ fn convolution_pfa(a: &[u64], b: &[u64], prime: u64, root: u64) -> Vec<u64> {
     fa.into_iter().map(u64::from).collect()
 }
 
+fn check_cancelled(cancelled: &std::sync::atomic::AtomicBool) -> Result<(), crate::MultiplyError> {
+    if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(crate::MultiplyError::cancelled());
+    }
+    Ok(())
+}
+
+pub(crate) fn mul_cancelled(
+    a: &[u64],
+    b: &[u64],
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<u64>, crate::MultiplyError> {
+    check_cancelled(cancelled)?;
+    if a.len().min(b.len()) <= HVH_CUTOFF {
+        return furer::mul_cancelled(a, b, cancelled);
+    }
+    mul_pool_cancelled(a, b, &mut WorkScratch::new(), cancelled)
+}
+
+fn mul_pool_cancelled(
+    a: &[u64],
+    b: &[u64],
+    pool: &mut WorkScratch,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<u64>, crate::MultiplyError> {
+    check_cancelled(cancelled)?;
+    let mut ea = pool.take();
+    expand_into(&mut ea, a);
+    check_cancelled(cancelled)?;
+    let mut eb = pool.take();
+    expand_into(&mut eb, b);
+    let conv = crt_two_prime_cancelled(&ea, &eb, cancelled)?;
+    pool.give(ea);
+    pool.give(eb);
+    let mut carried = pool.take();
+    carry_into(&mut carried, &conv);
+    pool.give(conv);
+    check_cancelled(cancelled)?;
+    let mut out = pool.take();
+    fold_into(&mut out, &carried);
+    pool.give(carried);
+    normalize_limbs(&mut out);
+    Ok(out)
+}
+
+fn pfa_forward_cancelled(
+    f: &mut [u32],
+    rows: usize,
+    cols: usize,
+    prime: u64,
+    root: u64,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<(), crate::MultiplyError> {
+    let n = rows * cols;
+    debug_assert_eq!(f.len(), n);
+    check_cancelled(cancelled)?;
+    let c_r = mod_inv(cols as u64 % rows as u64, rows as u64);
+    let r_c = mod_inv(rows as u64 % cols as u64, cols as u64);
+    let mut grid = vec![0u32; n];
+    for n1 in 0..rows {
+        check_cancelled(cancelled)?;
+        for n2 in 0..cols {
+            grid[n1 * cols + n2] = f[pfa_index_in(n1, n2, rows, cols)];
+        }
+    }
+    for r in 0..rows {
+        check_cancelled(cancelled)?;
+        dft_forward(&mut grid[r * cols..(r + 1) * cols], prime, root);
+    }
+    let mut col = vec![0u32; rows];
+    for c in 0..cols {
+        check_cancelled(cancelled)?;
+        for r in 0..rows {
+            col[r] = grid[r * cols + c];
+        }
+        dft_forward(&mut col, prime, root);
+        for r in 0..rows {
+            grid[r * cols + c] = col[r];
+        }
+    }
+    let mut out = vec![0u32; n];
+    for k1 in 0..rows {
+        for k2 in 0..cols {
+            out[pfa_index_out(k1, k2, rows, cols, c_r, r_c)] = grid[k1 * cols + k2];
+        }
+    }
+    f.copy_from_slice(&out);
+    Ok(())
+}
+
+fn pfa_inverse_cancelled(
+    f: &mut [u32],
+    rows: usize,
+    cols: usize,
+    prime: u64,
+    root: u64,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<(), crate::MultiplyError> {
+    let n = rows * cols;
+    debug_assert_eq!(f.len(), n);
+    check_cancelled(cancelled)?;
+    let c_r = mod_inv(cols as u64 % rows as u64, rows as u64);
+    let r_c = mod_inv(rows as u64 % cols as u64, cols as u64);
+    let mut grid = vec![0u32; n];
+    for k1 in 0..rows {
+        for k2 in 0..cols {
+            grid[k1 * cols + k2] = f[pfa_index_out(k1, k2, rows, cols, c_r, r_c)];
+        }
+    }
+    let mut col = vec![0u32; rows];
+    for c in 0..cols {
+        check_cancelled(cancelled)?;
+        for r in 0..rows {
+            col[r] = grid[r * cols + c];
+        }
+        dft_inverse(&mut col, prime, root);
+        for r in 0..rows {
+            grid[r * cols + c] = col[r];
+        }
+    }
+    for r in 0..rows {
+        check_cancelled(cancelled)?;
+        dft_inverse(&mut grid[r * cols..(r + 1) * cols], prime, root);
+    }
+    let mut out = vec![0u32; n];
+    for n1 in 0..rows {
+        for n2 in 0..cols {
+            out[pfa_index_in(n1, n2, rows, cols)] = grid[n1 * cols + n2];
+        }
+    }
+    f.copy_from_slice(&out);
+    Ok(())
+}
+
+fn convolution_pfa_cancelled(
+    a: &[u64],
+    b: &[u64],
+    prime: u64,
+    root: u64,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<u64>, crate::MultiplyError> {
+    if a.is_empty() || b.is_empty() {
+        return Ok(vec![0]);
+    }
+    check_cancelled(cancelled)?;
+    let (rows, cols) = pfa_shape(a.len() + b.len() - 1, prime);
+    let total = rows * cols;
+    let mut fa = vec![0u32; total];
+    let mut fb = vec![0u32; total];
+    for (i, limb) in a.iter().enumerate() {
+        fa[i] = (limb % prime) as u32;
+    }
+    for (i, limb) in b.iter().enumerate() {
+        fb[i] = (limb % prime) as u32;
+    }
+    pfa_forward_cancelled(&mut fa, rows, cols, prime, root, cancelled)?;
+    pfa_forward_cancelled(&mut fb, rows, cols, prime, root, cancelled)?;
+    for i in 0..total {
+        fa[i] = ((u64::from(fa[i]) * u64::from(fb[i])) % prime) as u32;
+    }
+    pfa_inverse_cancelled(&mut fa, rows, cols, prime, root, cancelled)?;
+    Ok(fa.into_iter().map(u64::from).collect())
+}
+
+fn crt_two_prime_cancelled(
+    a: &[u64],
+    b: &[u64],
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<u64>, crate::MultiplyError> {
+    if a.is_empty() || b.is_empty() {
+        return Ok(vec![0]);
+    }
+    check_cancelled(cancelled)?;
+    let r1 = convolution_pfa_cancelled(a, b, ntt::P1, ntt::P1_ROOT, cancelled)?;
+    let r2 = convolution_pfa_cancelled(a, b, ntt::P2, ntt::P2_ROOT, cancelled)?;
+    let inv_p1 = ntt::mod_pow(ntt::P1 % ntt::P2, ntt::P2 - 2, ntt::P2);
+    let need = a.len() + b.len() - 1;
+    let mut out = Vec::with_capacity(need);
+    for i in 0..need {
+        let x1 = r1[i];
+        let x2 = r2[i];
+        let diff = (x2 + ntt::P2 - x1 % ntt::P2) % ntt::P2;
+        let t = (diff as u128 * inv_p1 as u128) % ntt::P2 as u128;
+        let value = x1 as u128 + ntt::P1 as u128 * t;
+        out.push(value as u64);
+    }
+    normalize_limbs(&mut out);
+    Ok(out)
+}
+
 fn crt_two_prime(a: &[u64], b: &[u64]) -> Vec<u64> {
     if a.is_empty() || b.is_empty() {
         return vec![0];
@@ -689,5 +879,30 @@ mod tests {
             assert_eq!(mul_buf(&a, &b, &mut work), expected);
             assert!(verify_mod(&a, &b, &expected));
         }
+    }
+
+    #[test]
+    fn precancelled_mul_is_cancelled() {
+        use std::sync::atomic::AtomicBool;
+        let mut rng = ChaCha8Rng::seed_from_u64(0x9e3779b97f4a7c62);
+        let a = random_limbs(&mut rng, 4500);
+        let b = random_limbs(&mut rng, 4500);
+        let flag = AtomicBool::new(true);
+        assert!(matches!(
+            mul_cancelled(&a, &b, &flag),
+            Err(crate::MultiplyError::Cancelled(_))
+        ));
+    }
+
+    #[test]
+    fn cancelled_clear_matches_mul() {
+        use std::sync::atomic::AtomicBool;
+        let mut rng = ChaCha8Rng::seed_from_u64(0x9e3779b97f4a7c63);
+        let a = random_limbs(&mut rng, 4500);
+        let b = random_limbs(&mut rng, 4500);
+        let flag = AtomicBool::new(false);
+        let expected = mul(&a, &b);
+        assert_eq!(mul_cancelled(&a, &b, &flag).expect("runs"), expected);
+        assert!(verify_mod(&a, &b, &expected));
     }
 }

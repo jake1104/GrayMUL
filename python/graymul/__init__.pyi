@@ -57,6 +57,15 @@ def multiply_report(
     perf_mode: bool = False,
 ) -> dict[str, Any]: ...
 def version() -> str: ...
+def explain(
+    a: int,
+    b: int,
+    *,
+    threads: int | None = None,
+    timeout_seconds: int | None = None,
+    max_memory_mb: int | None = None,
+    max_cpu_seconds: int | None = None,
+) -> dict[str, Any]: ...
 def multiply_batch(
     pairs: list[tuple[int, int]],
     *,

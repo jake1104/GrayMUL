@@ -1,4 +1,6 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::time::Instant;
 
 pub const DEFAULT_MEMORY_BUDGET_BYTES: u64 = 1 << 30;
 pub const PROBE_BUDGET_MIN_MS: f64 = 1_000.0;
@@ -77,9 +79,7 @@ impl MultiplyOptions {
     }
 
     pub fn effective_workers(&self) -> usize {
-        let available = std::thread::available_parallelism()
-            .map(|value| value.get())
-            .unwrap_or(1);
+        let available = crate::par::available_workers();
         self.threads.unwrap_or(available).max(1)
     }
 

@@ -6,6 +6,7 @@ from . import _graymul
 
 __all__ = [
     "GrayMULError",
+    "explain",
     "multiply",
     "multiply_batch",
     "multiply_report",
@@ -41,8 +42,6 @@ def _to_gray_error(exc: ValueError) -> ValueError:
 def _validate_operand(value: int, name: str) -> str:
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError(name + " must be an integer")
-    if value < 0:
-        raise ValueError("input: " + name + " must be a non-negative integer")
     return str(value)
 
 
@@ -163,6 +162,62 @@ def stage_timings(
 
 def version() -> str:
     return str(_graymul.version())
+
+
+def explain(
+    a: int,
+    b: int,
+    *,
+    threads: int | None = None,
+    timeout_seconds: int | None = None,
+    max_memory_mb: int | None = None,
+    max_cpu_seconds: int | None = None,
+) -> dict[str, Any]:
+    """Return the pure execution plan for multiplying a by b without multiplying: {operands, dispatch, resources, verification}. The dispatch section keeps the static band route and the warmed-cache override on separate lines."""
+    try:
+        raw = _graymul.explain_decimal(
+            _validate_operand(a, "a"),
+            _validate_operand(b, "b"),
+            threads,
+            timeout_seconds,
+            max_memory_mb,
+            max_cpu_seconds,
+        )
+    except ValueError as exc:
+        raise _to_gray_error(exc)
+    operands = raw["operands"]
+    dispatch = raw["dispatch"]
+    resources = raw["resources"]
+    verification = raw["verification"]
+    return {
+        "operands": {
+            "limbs_a": int(operands["limbs_a"]),
+            "limbs_b": int(operands["limbs_b"]),
+            "limbs_max": int(operands["limbs_max"]),
+            "ratio": float(operands["ratio"]),
+            "negative_a": bool(operands["negative_a"]),
+            "negative_b": bool(operands["negative_b"]),
+            "negative": bool(operands["negative"]),
+        },
+        "dispatch": {
+            "static_route": str(dispatch["static_route"]),
+            "selected": str(dispatch["selected"]),
+            "reason": str(dispatch["reason"]),
+            "warmed_override": None
+            if dispatch["warmed_override"] is None
+            else str(dispatch["warmed_override"]),
+        },
+        "resources": {
+            "workers": int(resources["workers"]),
+            "est_memory_bytes": int(resources["est_memory_bytes"]),
+            "timeout_ms": None
+            if resources["timeout_ms"] is None
+            else int(resources["timeout_ms"]),
+        },
+        "verification": {
+            "methods": [str(entry) for entry in verification["methods"]],
+        },
+    }
 
 
 def multiply_batch(

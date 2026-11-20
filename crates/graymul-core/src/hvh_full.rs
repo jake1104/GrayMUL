@@ -23,6 +23,85 @@ pub fn mul_buf(a: &[u64], b: &[u64], work: &mut Vec<u64>) -> Vec<u64> {
     mul_work(a, b, work)
 }
 
+fn check_cancelled(cancelled: &std::sync::atomic::AtomicBool) -> Result<(), crate::MultiplyError> {
+    if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(crate::MultiplyError::cancelled());
+    }
+    Ok(())
+}
+
+pub(crate) fn mul_cancelled(
+    a: &[u64],
+    b: &[u64],
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<u64>, crate::MultiplyError> {
+    check_cancelled(cancelled)?;
+    mul_depth_cancelled(
+        a,
+        b,
+        0,
+        &mut Vec::new(),
+        depth_cap(a.len().max(b.len())),
+        cancelled,
+    )
+}
+
+fn mul_depth_cancelled(
+    a: &[u64],
+    b: &[u64],
+    depth: usize,
+    work: &mut Vec<u64>,
+    maxdepth: usize,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<u64>, crate::MultiplyError> {
+    if depth >= maxdepth || a.len().min(b.len()) <= HVH_FULL_CUTOFF {
+        return leaf_mul_cancelled(a, b, work, cancelled);
+    }
+    let chunks = if depth == 0 {
+        CHUNKS_DEPTH0
+    } else if depth == 1 {
+        CHUNKS_DEPTH1
+    } else {
+        CHUNKS_DEPTH2
+    };
+    let size = a.len().max(b.len()).div_ceil(chunks);
+    let ac = chunk_ranges(a, size);
+    let bc = chunk_ranges(b, size);
+    let mut out = vec![0u64];
+    for (i, (astart, aend)) in ac.iter().enumerate() {
+        for (j, (bstart, bend)) in bc.iter().enumerate() {
+            check_cancelled(cancelled)?;
+            let part = mul_depth_cancelled(
+                &a[*astart..*aend],
+                &b[*bstart..*bend],
+                depth + 1,
+                work,
+                maxdepth,
+                cancelled,
+            )?;
+            add_shifted(&mut out, &part, (i + j) * size);
+        }
+    }
+    normalize_limbs(&mut out);
+    Ok(out)
+}
+
+fn leaf_mul_cancelled(
+    a: &[u64],
+    b: &[u64],
+    _work: &mut Vec<u64>,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<u64>, crate::MultiplyError> {
+    check_cancelled(cancelled)?;
+    if a.is_empty() || b.is_empty() {
+        return Ok(vec![0]);
+    }
+    if a.len() + b.len() <= 32 {
+        return Ok(short_mul_limbs(a, b));
+    }
+    hvh::mul_cancelled(a, b, cancelled)
+}
+
 pub fn predicted_work_limbs(n: usize) -> f64 {
     hvh::predicted_work_limbs(n)
 }
@@ -406,5 +485,30 @@ mod tests {
             assert_eq!(result, hvh::mul(&a, &b));
             assert!(verify_mod(&a, &b, &result));
         }
+    }
+
+    #[test]
+    fn precancelled_mul_is_cancelled() {
+        use std::sync::atomic::AtomicBool;
+        let mut rng = ChaCha8Rng::seed_from_u64(0x9e3779b97f4a7c64);
+        let a = random_limbs(&mut rng, 300);
+        let b = random_limbs(&mut rng, 300);
+        let flag = AtomicBool::new(true);
+        assert!(matches!(
+            mul_cancelled(&a, &b, &flag),
+            Err(crate::MultiplyError::Cancelled(_))
+        ));
+    }
+
+    #[test]
+    fn cancelled_clear_matches_mul() {
+        use std::sync::atomic::AtomicBool;
+        let mut rng = ChaCha8Rng::seed_from_u64(0x9e3779b97f4a7c65);
+        let a = random_limbs(&mut rng, 300);
+        let b = random_limbs(&mut rng, 300);
+        let flag = AtomicBool::new(false);
+        let expected = mul(&a, &b);
+        assert_eq!(mul_cancelled(&a, &b, &flag).expect("runs"), expected);
+        assert!(verify_mod(&a, &b, &expected));
     }
 }

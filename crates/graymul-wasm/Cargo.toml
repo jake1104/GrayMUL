@@ -1,0 +1,18 @@
+[package]
+name = "graymul-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "WebAssembly bindings for GrayMUL"
+
+[lib]
+name = "graymul_wasm"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+graymul-core = { path = "../graymul-core" }
+wasm-bindgen = "0.2"
+serde_json.workspace = true
+console_error_panic_hook = "0.1"
+num-bigint.workspace = true

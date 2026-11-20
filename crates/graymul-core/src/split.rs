@@ -8,6 +8,17 @@ pub fn mul_split_par(a: &[u64], b: &[u64], workers: usize) -> Vec<u64> {
         return sub_product(a, b);
     }
     let half = big_len / 2;
+    #[cfg(target_arch = "wasm32")]
+    let (lo, hi) = {
+        if split_a {
+            let (alo, ahi) = a.split_at(half);
+            (sub_product(alo, b), sub_product(ahi, b))
+        } else {
+            let (blo, bhi) = b.split_at(half);
+            (sub_product(a, blo), sub_product(a, bhi))
+        }
+    };
+    #[cfg(not(target_arch = "wasm32"))]
     let (lo, hi) = std::thread::scope(|s| {
         if split_a {
             let (alo, ahi) = a.split_at(half);

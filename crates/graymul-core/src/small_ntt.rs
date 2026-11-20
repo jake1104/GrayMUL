@@ -1002,6 +1002,14 @@ pub fn convolution_parallel(a: &[u64], b: &[u64], workers: usize) -> Vec<u64> {
     let db = expand32(b);
     let need = da.len() + db.len() - 1;
     let prime_b_workers = workers / 2;
+    #[cfg(target_arch = "wasm32")]
+    let (r0, r1) = {
+        let _ = prime_b_workers;
+        let r0 = convolution_prime_par(&da, &db, P0, 1);
+        let r1 = convolution_prime_par(&da, &db, P1, 1);
+        (r0, r1)
+    };
+    #[cfg(not(target_arch = "wasm32"))]
     let (r0, r1) = std::thread::scope(|s| {
         let prime_b = s.spawn(|| convolution_prime_par(&da, &db, P1, prime_b_workers));
         let prime_a = convolution_prime_par(&da, &db, P0, workers - prime_b_workers);
@@ -1033,6 +1041,14 @@ fn convolution_prime_par(a: &[u64], b: &[u64], prime: u64, workers: usize) -> Ve
     } else {
         let back_workers = workers / 2;
         let front_workers = workers - back_workers;
+        #[cfg(target_arch = "wasm32")]
+        let (done_fa, done_fb) = {
+            let _ = (front_workers, back_workers);
+            ntt_parallel(&mut fa, false, prime, root, 1);
+            ntt_parallel(&mut fb, false, prime, root, 1);
+            (fa, fb)
+        };
+        #[cfg(not(target_arch = "wasm32"))]
         let (done_fa, done_fb) = std::thread::scope(|s| {
             let front = s.spawn(move || {
                 let mut front = fa;
@@ -1109,31 +1125,42 @@ fn transform_rows(
     workers: usize,
 ) {
     debug_assert_eq!(buf.len(), row_len * row_count);
-    let lanes = workers.max(1).min(row_count);
-    if lanes <= 1 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = workers;
         for row in buf.chunks_mut(row_len) {
             ntt_f64(row, invert, prime, root);
         }
         return;
     }
-    let chunk = row_count.div_ceil(lanes);
-    let mut blocks: Vec<&mut [f64]> = Vec::with_capacity(lanes);
-    let mut rest = &mut buf[..];
-    for k in 0..lanes {
-        let take = chunk.min(row_count - k * chunk) * row_len;
-        let (head, tail) = rest.split_at_mut(take);
-        blocks.push(head);
-        rest = tail;
-    }
-    std::thread::scope(|s| {
-        for block in blocks {
-            s.spawn(move || {
-                for row in block.chunks_mut(row_len) {
-                    ntt_f64(row, invert, prime, root);
-                }
-            });
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let lanes = workers.max(1).min(row_count);
+        if lanes <= 1 {
+            for row in buf.chunks_mut(row_len) {
+                ntt_f64(row, invert, prime, root);
+            }
+            return;
         }
-    });
+        let chunk = row_count.div_ceil(lanes);
+        let mut blocks: Vec<&mut [f64]> = Vec::with_capacity(lanes);
+        let mut rest = &mut buf[..];
+        for k in 0..lanes {
+            let take = chunk.min(row_count - k * chunk) * row_len;
+            let (head, tail) = rest.split_at_mut(take);
+            blocks.push(head);
+            rest = tail;
+        }
+        std::thread::scope(|s| {
+            for block in blocks {
+                s.spawn(move || {
+                    for row in block.chunks_mut(row_len) {
+                        ntt_f64(row, invert, prime, root);
+                    }
+                });
+            }
+        });
+    }
 }
 
 fn convolution_bailey(a: &[u64], b: &[u64], prime: u64) -> Vec<u64> {

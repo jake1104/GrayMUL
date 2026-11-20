@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::time::Instant;
+
+use crate::time::Instant;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Engine {
@@ -63,15 +64,14 @@ pub struct MulSignals {
     pub bits: u64,
     pub workers: usize,
     pub measured_ns_per_limb: HashMap<&'static str, f64>,
+    pub measured_coeff: HashMap<(&'static str, u64), f64>,
     pub pilot_limbs_per_ms: Option<f64>,
     pub remaining_ms_at_collect: Option<u128>,
 }
 
 impl MulSignals {
     pub fn collect(a_limbs: usize, b_limbs: usize, bits: u64, deadline: Option<Instant>) -> Self {
-        let workers = std::thread::available_parallelism()
-            .map(|value| value.get())
-            .unwrap_or(1);
+        let workers = crate::par::available_workers();
         let remaining_ms_at_collect =
             deadline.map(|limit| limit.saturating_duration_since(Instant::now()).as_millis());
         Self {
@@ -81,6 +81,7 @@ impl MulSignals {
             bits,
             workers,
             measured_ns_per_limb: HashMap::new(),
+            measured_coeff: HashMap::new(),
             pilot_limbs_per_ms: None,
             remaining_ms_at_collect,
         }
@@ -125,6 +126,44 @@ impl MulSignals {
         if rate.is_finite() && rate > 0.0 {
             self.measured_ns_per_limb.insert(engine_name, rate);
         }
+        if let Some(engine) = Engine::from_str(engine_name)
+            && let Some(coeff) = crate::cascade::coeff_for_observation(engine, limbs, elapsed_ns)
+        {
+            self.record_coeff(engine_name, limbs, coeff);
+        }
+    }
+
+    pub fn record_coeff(&mut self, engine_name: &'static str, limbs: usize, coeff: f64) {
+        if !coeff.is_finite() || coeff <= 0.0 {
+            return;
+        }
+        let band = crate::rate_cache::band_key_for_limbs(limbs);
+        self.measured_coeff.insert((engine_name, band), coeff);
+    }
+
+    pub fn coeff_for(&self, engine_name: &str, limbs: usize) -> Option<f64> {
+        let band = crate::rate_cache::band_key_for_limbs(limbs);
+        if let Some(coeff) = self.measured_coeff.get(&(engine_name, band)) {
+            return Some(*coeff);
+        }
+        let mut fallback: Option<(u64, f64)> = None;
+        for ((name, entry_band), coeff) in self.measured_coeff.iter() {
+            if *name != engine_name {
+                continue;
+            }
+            let distance = entry_band.abs_diff(band);
+            let replace = match fallback {
+                None => true,
+                Some((current_band, _)) => {
+                    distance < current_band.abs_diff(band)
+                        || (distance == current_band.abs_diff(band) && *entry_band < current_band)
+                }
+            };
+            if replace {
+                fallback = Some((*entry_band, *coeff));
+            }
+        }
+        fallback.map(|(_, coeff)| coeff)
     }
 
     pub fn report_pilot(&mut self, limbs: usize, elapsed_ms: u128) {
@@ -170,6 +209,14 @@ mod tests {
         assert_eq!(signals.workers, 1);
         signals.report_engine("schoolbook", 100, 5000);
         assert_eq!(signals.measured_ns_per_limb.get("schoolbook"), Some(&50.0));
+        assert_eq!(
+            signals.coeff_for("schoolbook", 100),
+            Some(5000.0 / crate::schoolbook::predicted_work_limbs(100))
+        );
+        assert_eq!(
+            signals.coeff_for("schoolbook", 4096),
+            signals.coeff_for("schoolbook", 100)
+        );
         signals.report_engine("karatsuba", 0, 999);
         assert!(!signals.measured_ns_per_limb.contains_key("karatsuba"));
         signals.report_pilot(200, 4);

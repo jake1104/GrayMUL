@@ -108,6 +108,8 @@ struct BenchArchive {
     #[serde(skip_serializing_if = "Option::is_none")]
     interleave_summary: Option<Vec<InterleaveSummary>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    asym_cells: Option<Vec<AsymCell>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     warmup: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     small_cell_ns: Option<u128>,
@@ -155,6 +157,12 @@ struct FaceoffRatio {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct AsymCell {
+    small: usize,
+    big: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct InterleavePair {
     limbs: usize,
     rep: usize,
@@ -182,6 +190,7 @@ enum Leg {
     Core(Engine),
     Probe(ProbeId),
     Split,
+    Chunk(Engine),
     NumBigint,
 }
 
@@ -245,12 +254,13 @@ impl ProbeId {
 }
 
 impl Leg {
-    fn name(self) -> &'static str {
+    fn name(self) -> String {
         match self {
-            Leg::Core(engine) => engine.name(),
-            Leg::Probe(probe) => probe.name(),
-            Leg::Split => "split",
-            Leg::NumBigint => "num-bigint",
+            Leg::Core(engine) => engine.name().to_string(),
+            Leg::Probe(probe) => probe.name().to_string(),
+            Leg::Split => "split".to_string(),
+            Leg::Chunk(engine) => format!("chunked/{}", engine.name()),
+            Leg::NumBigint => "num-bigint".to_string(),
         }
     }
 }
@@ -268,6 +278,9 @@ fn main() -> ExitCode {
     }
     if cli.tier == "interleave" {
         return run_interleave(&cli);
+    }
+    if cli.tier == "asym" {
+        return run_asym(&cli);
     }
     let tiers = match selected_tiers(&cli.tier) {
         Ok(tiers) => tiers,
@@ -315,6 +328,7 @@ fn main() -> ExitCode {
         interleave_engines: None,
         interleave_pairs: None,
         interleave_summary: None,
+        asym_cells: None,
     };
     if let Some(parent) = cli.output.parent() {
         let created = fs::create_dir_all(parent);
@@ -729,7 +743,7 @@ fn effective_reps(tier: &str, reps: Option<usize>) -> usize {
     match reps {
         Some(n) => n,
         None => {
-            if tier == "naked" || tier == "faceoff" || tier == "interleave" {
+            if tier == "naked" || tier == "faceoff" || tier == "interleave" || tier == "asym" {
                 NAKED_DEFAULT_REPS
             } else {
                 SWEEP_DEFAULT_REPS
@@ -784,6 +798,19 @@ fn parse_interleave_engines(text: &str) -> Result<[Leg; 2], String> {
             continue;
         }
         if trimmed.contains('/') {
+            if let Some(rest) = trimmed.strip_prefix("chunked/") {
+                match Engine::from_str(rest) {
+                    Some(engine) => {
+                        if engine == Engine::HvhFull {
+                            return Err("hvh-full is correctness-only, excluded from interleave"
+                                .to_string());
+                        }
+                        out.push(Leg::Chunk(engine));
+                        continue;
+                    }
+                    None => return Err(format!("unknown engine: {trimmed}")),
+                }
+            }
             match ProbeId::from_str(trimmed) {
                 Some(probe) => {
                     out.push(Leg::Probe(probe));
@@ -837,6 +864,86 @@ fn parse_naked_engines(text: &str) -> Result<Vec<Leg>, String> {
         return Err("naked engine list is empty".to_string());
     }
     Ok(out)
+}
+
+fn asym_add_shifted(out: &mut Vec<u64>, add: &[u64], shift: usize) {
+    if out.len() < shift + add.len() {
+        out.resize(shift + add.len(), 0);
+    }
+    let mut carry: u128 = 0;
+    let mut index = 0;
+    while index < add.len() || carry > 0 {
+        if shift + index >= out.len() {
+            out.push(0);
+        }
+        let slot = &mut out[shift + index];
+        let cur = u128::from(*slot) + u128::from(*add.get(index).unwrap_or(&0)) + carry;
+        *slot = cur as u64;
+        carry = cur >> 64;
+        index += 1;
+    }
+}
+
+fn asym_chunked_mul(a_limbs: &[u64], b_limbs: &[u64], engine: Engine) -> Vec<u64> {
+    let (big, small) = if a_limbs.len() >= b_limbs.len() {
+        (a_limbs, b_limbs)
+    } else {
+        (b_limbs, a_limbs)
+    };
+    let width = small.len().max(1);
+    let chunks = big.len().div_ceil(width).max(1);
+    let mut out = Vec::new();
+    for index in 0..chunks {
+        let lo = index * width;
+        let hi = (lo + width).min(big.len());
+        let sub = graymul_core::multiply_naked(engine, &big[lo..hi], small);
+        asym_add_shifted(&mut out, &sub, lo);
+    }
+    graymul_core::normalize_limbs(&mut out);
+    out
+}
+
+fn run_chunked_rep(
+    a_limbs: &[u64],
+    b_limbs: &[u64],
+    engine: Engine,
+    limbs: usize,
+    rep: usize,
+    warmup: bool,
+    verify: bool,
+) -> SweepRecord {
+    let label = format!("chunked/{}", engine.name());
+    let start = Instant::now();
+    let out = asym_chunked_mul(a_limbs, b_limbs, engine);
+    let elapsed_ns = start.elapsed().as_nanos();
+    let verified = verify && verify_mod(a_limbs, b_limbs, &out);
+    SweepRecord {
+        limbs,
+        rep,
+        engine: label.clone(),
+        method: label,
+        elapsed_ns,
+        ns_per_limb: elapsed_ns as f64 / limbs.max(1) as f64,
+        verified,
+        verify_in_timer: false,
+        warmup,
+    }
+}
+
+fn build_asym_cases(seed: u64) -> Vec<Case> {
+    let mut state = seed;
+    let mut cases = Vec::with_capacity(ASYM_SMALL_BIG.len());
+    for (small, big) in ASYM_SMALL_BIG {
+        let a = seeded_operand(&mut state, small);
+        let b = seeded_operand(&mut state, big);
+        cases.push(Case {
+            name: format!("asym_{small}x{big}"),
+            tier: "asym".to_string(),
+            a,
+            b,
+        });
+    }
+    cases
 }
 
 fn run_naked_rep(
@@ -958,6 +1065,17 @@ fn run_ssa_par_rep(
     }
 }
 
+const ASYM_SMALL_BIG: [(usize, usize); 8] = [
+    (32, 64),
+    (32, 256),
+    (32, 2048),
+    (32, 16384),
+    (128, 256),
+    (128, 1024),
+    (128, 8192),
+    (128, 65536),
+];
+
 #[allow(clippy::too_many_arguments)]
 fn run_naked_leg(
     a_limbs: &[u64],
@@ -982,6 +1100,7 @@ fn run_naked_leg(
             )
         }
         Leg::Core(engine) => run_naked_rep(a_limbs, b_limbs, engine, limbs, rep, warmup, verify),
+        Leg::Chunk(engine) => run_chunked_rep(a_limbs, b_limbs, engine, limbs, rep, warmup, verify),
         Leg::Split => run_split_rep(a_limbs, b_limbs, limbs, rep, warmup, verify, threads),
         Leg::Probe(probe) => run_probe_rep(a_limbs, b_limbs, probe, limbs, rep, warmup, verify),
         Leg::NumBigint => unreachable!("naked tiers never parse control legs"),
@@ -1048,6 +1167,7 @@ fn run_leg(
             )
         }
         Leg::Core(engine) => run_naked_rep(a_limbs, b_limbs, engine, limbs, rep, warmup, verify),
+        Leg::Chunk(engine) => run_chunked_rep(a_limbs, b_limbs, engine, limbs, rep, warmup, verify),
         Leg::Probe(probe) => run_probe_rep(a_limbs, b_limbs, probe, limbs, rep, warmup, verify),
         Leg::Split => run_split_rep(a_limbs, b_limbs, limbs, rep, warmup, verify, threads),
         Leg::NumBigint => run_control_rep(case, rep, warmup, verify),
@@ -1179,8 +1299,8 @@ fn run_interleave_cell(
     let summary_median_b = median_of(&final_b).unwrap_or(0.0);
     let summary = InterleaveSummary {
         limbs,
-        engine_a: legs[0].name().to_string(),
-        engine_b: legs[1].name().to_string(),
+        engine_a: legs[0].name(),
+        engine_b: legs[1].name(),
         reps: pairs.len(),
         median_a_ns: summary_median_a,
         median_b_ns: summary_median_b,
@@ -1297,6 +1417,7 @@ fn run_sweep(cli: &Cli) -> ExitCode {
         interleave_engines: None,
         interleave_pairs: None,
         interleave_summary: None,
+        asym_cells: None,
     };
     if let Some(parent) = cli.output.parent() {
         let created = fs::create_dir_all(parent);
@@ -1396,7 +1517,7 @@ fn run_naked(cli: &Cli) -> ExitCode {
             extend_small_cell(
                 &mut cell_records,
                 limbs,
-                engine.name(),
+                &engine.name(),
                 small_ns,
                 small_reps,
                 |rep| {
@@ -1412,7 +1533,7 @@ fn run_naked(cli: &Cli) -> ExitCode {
                     )
                 },
             );
-            summaries.push(summarize_sweep(limbs, engine.name(), &cell_records));
+            summaries.push(summarize_sweep(limbs, &engine.name(), &cell_records));
             records.extend(cell_records);
         }
     }
@@ -1429,12 +1550,7 @@ fn run_naked(cli: &Cli) -> ExitCode {
         sweep_limbs: Some(limbs_list),
         sweep_reps: Some(reps),
         sweep_engine: None,
-        naked_engines: Some(
-            engines
-                .iter()
-                .map(|engine| engine.name().to_string())
-                .collect(),
-        ),
+        naked_engines: Some(engines.iter().map(|engine| engine.name()).collect()),
         faceoff_engines: None,
         faceoff_ratios: None,
         warmup: Some(warmup),
@@ -1446,6 +1562,7 @@ fn run_naked(cli: &Cli) -> ExitCode {
         interleave_engines: None,
         interleave_pairs: None,
         interleave_summary: None,
+        asym_cells: None,
     };
     if let Some(parent) = cli.output.parent() {
         let created = fs::create_dir_all(parent);
@@ -1548,7 +1665,7 @@ fn run_faceoff(cli: &Cli) -> ExitCode {
                 .filter(|record| record.engine == engine.name())
                 .cloned()
                 .collect();
-            let probe = summarize_sweep(limbs, engine.name(), &subset);
+            let probe = summarize_sweep(limbs, &engine.name(), &subset);
             if needs_extension(probe.median_ns, small_ns) {
                 let base = cell_records.len();
                 for extra in 0..small_reps {
@@ -1572,7 +1689,7 @@ fn run_faceoff(cli: &Cli) -> ExitCode {
                 .filter(|record| record.engine == engine.name())
                 .cloned()
                 .collect();
-            let summary = summarize_sweep(limbs, engine.name(), &subset);
+            let summary = summarize_sweep(limbs, &engine.name(), &subset);
             medians.push(summary.median_ns);
             summaries.push(summary);
         }
@@ -1580,8 +1697,8 @@ fn run_faceoff(cli: &Cli) -> ExitCode {
             for (engine, median) in engines.iter().zip(medians.iter()).skip(1) {
                 ratios.push(FaceoffRatio {
                     limbs,
-                    engine: engine.name().to_string(),
-                    vs: engines[0].name().to_string(),
+                    engine: engine.name(),
+                    vs: engines[0].name(),
                     ratio: median / medians[0],
                 });
             }
@@ -1609,12 +1726,7 @@ fn run_faceoff(cli: &Cli) -> ExitCode {
         sweep_reps: Some(reps),
         sweep_engine: None,
         naked_engines: None,
-        faceoff_engines: Some(
-            engines
-                .iter()
-                .map(|engine| engine.name().to_string())
-                .collect(),
-        ),
+        faceoff_engines: Some(engines.iter().map(|engine| engine.name()).collect()),
         faceoff_ratios: Some(ratios),
         warmup: Some(warmup),
         small_cell_ns: Some(small_ns),
@@ -1625,6 +1737,7 @@ fn run_faceoff(cli: &Cli) -> ExitCode {
         interleave_engines: None,
         interleave_pairs: None,
         interleave_summary: None,
+        asym_cells: None,
     };
     if let Some(parent) = cli.output.parent() {
         let created = fs::create_dir_all(parent);
@@ -1773,9 +1886,10 @@ fn run_interleave(cli: &Cli) -> ExitCode {
         naked_engines: None,
         faceoff_engines: None,
         faceoff_ratios: None,
-        interleave_engines: Some(legs.iter().map(|leg| leg.name().to_string()).collect()),
+        interleave_engines: Some(legs.iter().map(|leg| leg.name()).collect()),
         interleave_pairs: Some(pairs),
         interleave_summary: Some(summaries),
+        asym_cells: None,
         warmup: Some(warmup),
         small_cell_ns: Some(small_ns),
         small_reps: Some(small_reps),
@@ -1808,6 +1922,164 @@ fn run_interleave(cli: &Cli) -> ExitCode {
                 let created = fs::create_dir_all(parent);
                 if let Err(error) = created {
                     eprintln!("error: internal: cannot create csv dir: {error}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        if let Err(error) = fs::write(csv_path, sweep_csv(&records)) {
+            eprintln!("error: internal: cannot write csv: {error}");
+            return ExitCode::FAILURE;
+        }
+        println!("csv: {}", csv_path.display());
+    }
+    if all_verified(
+        archive.sweep_records.as_deref().unwrap_or(&[]),
+        cli.verify_naked,
+    ) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn run_asym(cli: &Cli) -> ExitCode {
+    let engines_text = match &cli.engines {
+        Some(text) => text.clone(),
+        None => {
+            eprintln!("error: input: --engines <A,B> is required for the asym tier");
+            return ExitCode::FAILURE;
+        }
+    };
+    let legs = match parse_interleave_engines(&engines_text) {
+        Ok(legs) => legs,
+        Err(error) => {
+            eprintln!("error: input: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if cli.reps == Some(0) {
+        eprintln!("error: input: reps must be at least 1");
+        return ExitCode::FAILURE;
+    }
+    let reps = effective_reps("asym", cli.reps);
+    let warmup = effective_warmup(cli.warmup);
+    let small_ns = effective_small_cell_ns(cli.small_cell_ns);
+    let small_reps = effective_small_reps(cli.small_reps);
+    let threads_effective = cli.threads.unwrap_or(
+        std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1),
+    );
+    let timestamp_unix_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let cases = build_asym_cases(cli.seed);
+    let mut records = Vec::new();
+    let mut summaries = Vec::new();
+    let mut pairs = Vec::new();
+    for case in &cases {
+        let a_limbs = graymul_core::from_bigint(&case.a);
+        let b_limbs = graymul_core::from_bigint(&case.b);
+        let limbs = a_limbs.len().max(b_limbs.len());
+        let (cell_records, cell_pairs, summary) = run_interleave_cell(
+            case,
+            &a_limbs,
+            &b_limbs,
+            limbs,
+            &legs,
+            reps,
+            warmup,
+            cli.verify_naked,
+            small_ns,
+            small_reps,
+            cli.threads,
+        );
+        summaries.push(summary);
+        records.extend(cell_records);
+        pairs.extend(cell_pairs);
+    }
+    println!(
+        "limbs,engine_a,engine_b,reps,median_a_ns,median_b_ns,median_delta_ns,std_delta_ns,ratio,verified_all"
+    );
+    for summary in &summaries {
+        println!(
+            "{},{},{},{},{},{},{},{},{},{},{}",
+            summary.limbs,
+            summary.engine_a,
+            summary.engine_b,
+            summary.reps,
+            summary.median_a_ns,
+            summary.median_b_ns,
+            summary.median_delta_ns,
+            summary.std_delta_ns,
+            summary.ratio_a_over_b,
+            summary.cv_delta,
+            summary.verified_all
+        );
+    }
+    println!("limbs,rep,delta_ns");
+    for pair in &pairs {
+        println!("{},{},{}", pair.limbs, pair.rep, pair.delta_ns);
+    }
+    let asym_cells: Vec<AsymCell> = ASYM_SMALL_BIG
+        .iter()
+        .map(|(small, big)| AsymCell {
+            small: *small,
+            big: *big,
+        })
+        .collect();
+    let archive = BenchArchive {
+        task_id: cli.task_id.clone(),
+        tier: "asym".to_string(),
+        timeout_seconds: cli.timeout_seconds,
+        threads_requested: cli.threads,
+        threads_effective,
+        seeds: vec![cli.seed],
+        timestamp_unix_secs,
+        observations: Vec::new(),
+        sweep_limbs: None,
+        sweep_reps: Some(reps),
+        sweep_engine: None,
+        naked_engines: None,
+        faceoff_engines: None,
+        faceoff_ratios: None,
+        interleave_engines: Some(legs.iter().map(|leg| leg.name()).collect()),
+        interleave_pairs: Some(pairs),
+        interleave_summary: Some(summaries),
+        asym_cells: Some(asym_cells),
+        warmup: Some(warmup),
+        small_cell_ns: Some(small_ns),
+        small_reps: Some(small_reps),
+        verify_naked: Some(cli.verify_naked),
+        sweep_records: Some(records.clone()),
+        sweep_summary: None,
+    };
+    if let Some(parent) = cli.output.parent() {
+        let created = fs::create_dir_all(parent);
+        if let Err(error) = created {
+            eprintln!("error: internal: cannot create output dir: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let payload = match serde_json::to_vec_pretty(&archive) {
+        Ok(payload) => payload,
+        Err(error) => {
+            eprintln!("error: internal: cannot encode archive: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(error) = fs::write(&cli.output, payload) {
+        eprintln!("error: internal: cannot write output: {error}");
+        return ExitCode::FAILURE;
+    }
+    println!("json: {}", cli.output.display());
+    if let Some(csv_path) = &cli.csv {
+        if let Some(parent) = csv_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let created = fs::create_dir_all(parent);
+                if let Err(error) = created {
+                    eprintln!("error: internal: cannot write csv dir: {error}");
                     return ExitCode::FAILURE;
                 }
             }
@@ -1925,6 +2197,7 @@ mod tests {
             interleave_engines: None,
             interleave_pairs: None,
             interleave_summary: None,
+            asym_cells: None,
         };
         let value = serde_json::to_value(&archive).expect("serializes");
         for key in [
@@ -1971,6 +2244,7 @@ mod tests {
             interleave_engines: None,
             interleave_pairs: None,
             interleave_summary: None,
+            asym_cells: None,
         };
         let value = serde_json::to_value(&archive).expect("serializes");
         for key in [
@@ -2207,6 +2481,7 @@ mod tests {
             interleave_engines: None,
             interleave_pairs: None,
             interleave_summary: None,
+            asym_cells: None,
         };
         let value = serde_json::to_value(&archive).expect("serializes");
         for key in [
@@ -2634,6 +2909,56 @@ mod tests {
     }
 
     #[test]
+    fn asym_cells_cover_eight_ratio_cells_deterministically() {
+        let first = build_asym_cases(0x9e3779b97f4a7c15);
+        let second = build_asym_cases(0x9e3779b97f4a7c15);
+        assert_eq!(first.len(), ASYM_SMALL_BIG.len());
+        for (index, (small, big)) in ASYM_SMALL_BIG.iter().enumerate() {
+            assert_eq!(from_bigint(&first[index].a).len(), *small);
+            assert_eq!(from_bigint(&first[index].b).len(), *big);
+            assert_eq!(first[index].name, format!("asym_{small}x{big}"));
+            assert_eq!(first[index].a, second[index].a);
+            assert_eq!(first[index].b, second[index].b);
+        }
+        let other = build_asym_cases(8);
+        assert!(other[0].a != first[0].a || other[0].b != first[0].b);
+        assert_eq!(
+            effective_reps("asym", None),
+            effective_reps("interleave", None)
+        );
+    }
+
+    #[test]
+    fn asym_chunked_leg_matches_serial_bit_identical() {
+        let pair = parse_interleave_engines("chunked/schoolbook,schoolbook").expect("chunked pair");
+        assert_eq!(pair[0].name(), "chunked/schoolbook");
+        assert_eq!(pair[1].name(), "schoolbook");
+        assert!(parse_interleave_engines("chunked/hvh-full,schoolbook").is_err());
+        assert!(parse_interleave_engines("chunked/wat,schoolbook").is_err());
+        let cases = build_asym_cases(0x9e3779b97f4a7c15);
+        for case in cases.iter().take(6) {
+            let a_limbs = from_bigint(&case.a);
+            let b_limbs = from_bigint(&case.b);
+            let limbs = a_limbs.len().max(b_limbs.len());
+            let record = run_chunked_rep(
+                &a_limbs,
+                &b_limbs,
+                Engine::Schoolbook,
+                limbs,
+                0,
+                false,
+                true,
+            );
+            assert!(record.verified);
+            assert_eq!(record.engine, "chunked/schoolbook");
+            assert_eq!(
+                asym_chunked_mul(&a_limbs, &b_limbs, Engine::Schoolbook),
+                graymul_core::multiply_naked(Engine::Schoolbook, &a_limbs, &b_limbs)
+            );
+        }
+    }
+
+    #[test]
     fn interleave_envelope_carries_provenance_keys() {
         let archive = BenchArchive {
             task_id: "0.0.0.17.1".to_string(),
@@ -2659,6 +2984,7 @@ mod tests {
             interleave_engines: Some(vec!["schoolbook".to_string(), "karatsuba".to_string()]),
             interleave_pairs: Some(Vec::new()),
             interleave_summary: Some(Vec::new()),
+            asym_cells: None,
         };
         let value = serde_json::to_value(&archive).expect("serializes");
         for key in [

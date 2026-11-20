@@ -49,3 +49,46 @@ jobs:
         run: cargo build -p graymul-cli -p graymul-bench --release
       - name: perf-smoke
         run: python scripts/perf_smoke.py
+  linux-gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: fmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        run: cargo test --workspace
+      - name: release-build
+        run: cargo build -p graymul-cli -p graymul-bench --release
+      - name: perf-smoke
+        run: python scripts/perf_smoke.py
+  wasm-build-smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+          fallback: cargo-install
+      - name: wasm-check
+        run: cargo check -p graymul-core --target wasm32-unknown-unknown
+      - name: wasm-pack-build
+        run: wasm-pack build crates/graymul-wasm --target web --release --out-dir pkg
+      - name: wasm-smoke
+        run: node scripts/wasm-smoke.mjs

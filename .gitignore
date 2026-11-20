@@ -5,6 +5,8 @@
 # Local probe scripts, backups, and reports (see AGENTS.md)
 # NOTE: AGENTS.md, todo.md and CHANGELOG.md must never be added here;
 # they stay out of git by manual staging discipline, not by ignore rules.
+# wasm-pack output
+crates/graymul-wasm/pkg/
 /probe/
 # Python virtualenvs, caches, and compiled artifacts
 .venv/

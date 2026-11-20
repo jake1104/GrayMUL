@@ -3,7 +3,7 @@ use crate::dispatch::{Engine, MulSignals};
 pub const DISPATCH_FRACTION: f64 = 0.2;
 pub const SIGMA_MULT: f64 = 3.0;
 
-fn predicted_work(engine: Engine, limbs: usize) -> f64 {
+pub(crate) fn predicted_work(engine: Engine, limbs: usize) -> f64 {
     match engine {
         Engine::Schoolbook => crate::schoolbook::predicted_work_limbs(limbs),
         Engine::Karatsuba => crate::karatsuba::predicted_work_limbs(limbs),
@@ -16,13 +16,26 @@ fn predicted_work(engine: Engine, limbs: usize) -> f64 {
     }
 }
 
-pub fn project_cost_ms(engine: Engine, limbs: usize, signals: &MulSignals) -> Option<u128> {
-    let rate = *signals.measured_ns_per_limb.get(engine.name())?;
+pub(crate) fn coeff_for_observation(engine: Engine, limbs: usize, elapsed_ns: u128) -> Option<f64> {
     let work = predicted_work(engine, limbs);
-    if !rate.is_finite() || rate <= 0.0 || !work.is_finite() || work <= 0.0 {
+    if !work.is_finite() || work <= 0.0 {
         return None;
     }
-    let cost_ms = rate * work / 1_000_000.0;
+    let coeff = elapsed_ns as f64 / work;
+    if coeff.is_finite() && coeff > 0.0 {
+        Some(coeff)
+    } else {
+        None
+    }
+}
+
+pub fn project_cost_ms(engine: Engine, limbs: usize, signals: &MulSignals) -> Option<u128> {
+    let coeff = signals.coeff_for(engine.name(), limbs)?;
+    let work = predicted_work(engine, limbs);
+    if !coeff.is_finite() || coeff <= 0.0 || !work.is_finite() || work <= 0.0 {
+        return None;
+    }
+    let cost_ms = coeff * work / 1_000_000.0;
     if cost_ms.is_finite() {
         Some(cost_ms.ceil() as u128)
     } else {
@@ -30,13 +43,12 @@ pub fn project_cost_ms(engine: Engine, limbs: usize, signals: &MulSignals) -> Op
     }
 }
 
-pub fn project_cost_raw_ns(engine: Engine, limbs: usize, rate_ns_per_limb: f64) -> Option<f64> {
+pub fn project_cost_raw_ns(engine: Engine, limbs: usize, coeff_per_work: f64) -> Option<f64> {
     let work = predicted_work(engine, limbs);
-    if !rate_ns_per_limb.is_finite() || rate_ns_per_limb <= 0.0 || !work.is_finite() || work <= 0.0
-    {
+    if !coeff_per_work.is_finite() || coeff_per_work <= 0.0 || !work.is_finite() || work <= 0.0 {
         return None;
     }
-    let cost_ns = rate_ns_per_limb * work;
+    let cost_ns = coeff_per_work * work;
     if cost_ns.is_finite() && cost_ns > 0.0 {
         Some(cost_ns)
     } else {
@@ -323,10 +335,11 @@ mod tests {
     use super::*;
     use crate::dispatch::MulSignals;
 
-    fn measured(rate: f64) -> MulSignals {
+    fn measured(coeff: f64) -> MulSignals {
         let mut signals = MulSignals::collect(64, 64, 4096, None);
         for engine in Engine::all() {
-            signals.report_engine(engine.name(), 1000, (rate * 1000.0) as u128);
+            let work = predicted_work(engine, 1000);
+            signals.report_engine(engine.name(), 1000, (coeff * work) as u128);
         }
         signals
     }
@@ -340,11 +353,14 @@ mod tests {
 
     #[test]
     fn measured_rate_projects_scaled_cost() {
-        let signals = measured(1000.0);
+        let coeff = 1000.0;
+        let signals = measured(coeff);
         let limbs = 64usize;
+        let observed = (coeff * crate::schoolbook::predicted_work_limbs(1000)) as u128;
+        let stored = observed as f64 / crate::schoolbook::predicted_work_limbs(1000);
         let cost = project_cost_ms(Engine::Schoolbook, limbs, &signals).expect("cost");
         let work = crate::schoolbook::predicted_work_limbs(limbs);
-        assert_eq!(cost, (1000.0 * work / 1_000_000.0).ceil() as u128);
+        assert_eq!(cost, (stored * work / 1_000_000.0).ceil() as u128);
     }
 
     #[test]
@@ -353,8 +369,9 @@ mod tests {
         signals.report_engine("toom4", 1000, 1_000_000);
         let limbs = 256usize;
         let cost = project_cost_ms(Engine::Toom4, limbs, &signals).expect("cost");
+        let stored = 1_000_000.0 / crate::toom::predicted_work_limbs_toom4(1000);
         let work = crate::toom::predicted_work_limbs_toom4(limbs);
-        assert_eq!(cost, (1000.0 * work / 1_000_000.0).ceil() as u128);
+        assert_eq!(cost, (stored * work / 1_000_000.0).ceil() as u128);
         assert_ne!(work, crate::toom::predicted_work_limbs(limbs));
     }
 
@@ -573,6 +590,18 @@ mod tests {
         assert!(!margin_clears_variance(0.03, 0.01));
         assert!(!margin_clears_variance(f64::NAN, 0.01));
         assert!(!margin_clears_variance(0.5, f64::INFINITY));
+    }
+
+    #[test]
+    fn banded_coeff_projects_by_work_shape() {
+        let mut signals = MulSignals::collect(64, 64, 4096, None);
+        let coeff = 2.5;
+        let observed = (coeff * crate::schoolbook::predicted_work_limbs(100)) as u128;
+        signals.report_engine("schoolbook", 100, observed);
+        let limbs = 500usize;
+        let cost = project_cost_ms(Engine::Schoolbook, limbs, &signals).expect("cost");
+        let work = crate::schoolbook::predicted_work_limbs(limbs);
+        assert_eq!(cost, (coeff * work / 1_000_000.0).ceil() as u128);
     }
 
     #[test]

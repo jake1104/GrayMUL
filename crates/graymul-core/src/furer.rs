@@ -43,6 +43,73 @@ pub fn mul_buf(a: &[u64], b: &[u64], work: &mut Vec<u64>) -> Vec<u64> {
     mul_trunc(a, b)
 }
 
+fn check_cancelled(cancelled: &std::sync::atomic::AtomicBool) -> Result<(), crate::MultiplyError> {
+    if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(crate::MultiplyError::cancelled());
+    }
+    Ok(())
+}
+
+pub(crate) fn mul_cancelled(
+    a: &[u64],
+    b: &[u64],
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<u64>, crate::MultiplyError> {
+    check_cancelled(cancelled)?;
+    if a.len().min(b.len()) <= FURER_CUTOFF {
+        return schonhage::mul_cancelled(a, b, cancelled);
+    }
+    if a.len().min(b.len()) <= FURER_TRUNC_CUTOFF {
+        return mul_work_cancelled(a, b, &mut Vec::new(), cancelled);
+    }
+    mul_trunc_cancelled(a, b, cancelled)
+}
+
+fn mul_work_cancelled(
+    a: &[u64],
+    b: &[u64],
+    work: &mut Vec<u64>,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<u64>, crate::MultiplyError> {
+    if a.len().min(b.len()) <= FURER_CUTOFF {
+        return schonhage::mul_cancelled(a, b, cancelled);
+    }
+    let size = a.len().max(b.len()).div_ceil(CHUNKS);
+    let ac = chunk_ranges(a, size);
+    let bc = chunk_ranges(b, size);
+    let mut out = vec![0u64];
+    for (i, (astart, aend)) in ac.iter().enumerate() {
+        for (j, (bstart, bend)) in bc.iter().enumerate() {
+            check_cancelled(cancelled)?;
+            let part = schonhage::mul_buf(&a[*astart..*aend], &b[*bstart..*bend], work);
+            add_shifted(&mut out, &part, (i + j) * size);
+        }
+    }
+    normalize_limbs(&mut out);
+    Ok(out)
+}
+
+pub(crate) fn mul_trunc_cancelled(
+    a: &[u64],
+    b: &[u64],
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<u64>, crate::MultiplyError> {
+    check_cancelled(cancelled)?;
+    let size = a.len().max(b.len()).div_ceil(CHUNKS);
+    let ac = chunk_ranges(a, size);
+    let bc = chunk_ranges(b, size);
+    let mut out = vec![0u64];
+    for (i, (astart, aend)) in ac.iter().enumerate() {
+        for (j, (bstart, bend)) in bc.iter().enumerate() {
+            check_cancelled(cancelled)?;
+            let part = chunk_product_trunc(&a[*astart..*aend], &b[*bstart..*bend]);
+            add_shifted(&mut out, &part, (i + j) * size);
+        }
+    }
+    normalize_limbs(&mut out);
+    Ok(out)
+}
+
 pub fn mul_trunc(a: &[u64], b: &[u64]) -> Vec<u64> {
     let size = a.len().max(b.len()).div_ceil(CHUNKS);
     let ac = chunk_ranges(a, size);
@@ -418,5 +485,30 @@ mod tests {
         let b = random_limbs(&mut rng, 3000);
         let mut work = Vec::new();
         assert_eq!(mul(&a, &b), mul_work(&a, &b, &mut work));
+    }
+
+    #[test]
+    fn precancelled_mul_is_cancelled() {
+        use std::sync::atomic::AtomicBool;
+        let mut rng = ChaCha8Rng::seed_from_u64(0x9e3779b97f4a7c60);
+        let a = random_limbs(&mut rng, 2500);
+        let b = random_limbs(&mut rng, 2500);
+        let flag = AtomicBool::new(true);
+        assert!(matches!(
+            mul_cancelled(&a, &b, &flag),
+            Err(crate::MultiplyError::Cancelled(_))
+        ));
+    }
+
+    #[test]
+    fn cancelled_clear_matches_mul() {
+        use std::sync::atomic::AtomicBool;
+        let mut rng = ChaCha8Rng::seed_from_u64(0x9e3779b97f4a7c61);
+        let a = random_limbs(&mut rng, 2500);
+        let b = random_limbs(&mut rng, 2200);
+        let flag = AtomicBool::new(false);
+        let expected = mul(&a, &b);
+        assert_eq!(mul_cancelled(&a, &b, &flag).expect("runs"), expected);
+        assert!(verify_mod(&a, &b, &expected));
     }
 }

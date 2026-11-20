@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "graymul"
-version = "0.1.0"
+version = "0.1.1"
 description = "Fast integer multiplication (schoolbook, Karatsuba, Toom-Cook, NTT, Harvey-van der Hoeven) with Python bindings"
 license = { text = "MIT" }
 authors = [{ name = "GrayMUL contributors" }]

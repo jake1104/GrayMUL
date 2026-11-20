@@ -18,6 +18,7 @@ EXPECTED_HELP_FLAGS = [
 ]
 
 EXPECTED_PYTHON_CALLABLES = [
+    "explain",
     "multiply",
     "multiply_report",
     "multiply_batch",
@@ -27,6 +28,8 @@ EXPECTED_PYTHON_CALLABLES = [
 ]
 
 EXPECTED_ERROR_VARIANTS = ["Input", "ResourceLimit", "Cancelled", "Internal"]
+
+EXPECTED_WASM_EXPORTS = ["pub fn version", "pub fn multiply"]
 
 
 def read_text(path):
@@ -53,11 +56,15 @@ def check_repo(root):
         batch = subprocess.run(
             [str(cli_bin), "batch", "--help"], capture_output=True, text=True, timeout=60
         )
+        explain = subprocess.run(
+            [str(cli_bin), "explain", "--help"], capture_output=True, text=True, timeout=60
+        )
     except (OSError, subprocess.SubprocessError) as exc:
         print("MISMATCH: cannot run CLI help: %s" % exc)
         return 1
     top_help = top.stdout + top.stderr
     batch_help = batch.stdout + batch.stderr
+    explain_help = explain.stdout + explain.stderr
     for flag in EXPECTED_HELP_FLAGS:
         record(
             "CLI carries %s" % flag,
@@ -78,6 +85,18 @@ def check_repo(root):
         "--continue-on-error missing from batch --help"
         if "--continue-on-error" not in batch_help
         else "",
+    )
+    record(
+        "CLI carries explain subcommand",
+        str(cli_bin),
+        "explain" in top_help,
+        "explain missing from --help" if "explain" not in top_help else "",
+    )
+    record(
+        "CLI explain carries --json",
+        str(cli_bin),
+        "--json" in explain_help,
+        "--json missing from explain --help" if "--json" not in explain_help else "",
     )
 
     try:
@@ -110,6 +129,26 @@ def check_repo(root):
         str(error_path),
         not missing_variants,
         "missing=%s" % missing_variants if missing_variants else "",
+    )
+
+    wasm_path = root / "crates" / "graymul-wasm" / "src" / "lib.rs"
+    try:
+        wasm_text = read_text(wasm_path)
+    except OSError as exc:
+        print("MISMATCH: cannot read %s: %s" % (wasm_path, exc))
+        return 1
+    missing_exports = [name for name in EXPECTED_WASM_EXPORTS if name not in wasm_text]
+    record(
+        "wasm exports present",
+        str(wasm_path),
+        not missing_exports,
+        "missing=%s" % missing_exports if missing_exports else "",
+    )
+    record(
+        "wasm multiply takes pair plus budget",
+        str(wasm_path),
+        "a_text" in wasm_text and "b_text" in wasm_text and "budget_ms" in wasm_text,
+        "multiply(a, b, budget) signature drift" if "budget_ms" not in wasm_text else "",
     )
 
     failures = [entry for entry in results if not entry["ok"]]
